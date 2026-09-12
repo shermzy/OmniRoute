@@ -1,0 +1,154 @@
+name: Mirror image to shermzy GHCR
+
+# Fork-only deployment automation — NOT for the diegosouzapw upstream.
+#
+# The Coolify "omniroute" service (t3ai.xyz) runs a docker-compose service
+# pinned by digest to ghcr.io/shermzy/omniroute, not a git-connected app that
+# rebuilds on push. Upstream's own docker-publish.yml only ever publishes to
+# ghcr.io/diegosouzapw/omniroute and Docker Hub — it has no knowledge of this
+# fork's registry namespace or of Coolify. This workflow closes that gap:
+#
+#   1. Wait for upstream's "Publish to Docker Hub" run to succeed (guarantees
+#      the source image already exists in GHCR).
+#   2. Copy that image's manifest into ghcr.io/shermzy/omniroute via
+#      `docker buildx imagetools create` — a registry-to-registry digest copy,
+#      no rebuild. This deliberately avoids re-running `npm run build` on a
+#      hosted runner: build.yml (#11946) documents that tree OOM-killing the
+#      hosted 7 GB runner, which is why that workflow is manual-dispatch-only.
+#   3. Patch the Coolify service application's `image` field to the new
+#      digest and restart it so the compose service actually redeploys.
+#
+# Requires repo secrets COOLIFY_URL and COOLIFY_API_TOKEN (a *write*-capable
+# Coolify API token — the read-only variant cannot PATCH), and repo variables
+# COOLIFY_SERVICE_UUID / COOLIFY_APP_UUID for the omniroute service/app.
+on:
+  workflow_run:
+    workflows: ["Publish to Docker Hub"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream tag/channel to mirror (e.g. "3.8.51", "next", "main").'
+        required: false
+        type: string
+        default: "next"
+      deploy:
+        description: "Also patch + restart the Coolify service after mirroring"
+        required: false
+        type: boolean
+        default: true
+
+# One mirror/deploy at a time — a PATCH racing an in-flight restart would be
+# confusing to debug, and there is only one omniroute service to update.
+concurrency:
+  group: mirror-shermzy-ghcr
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for the shared version-resolver script)
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve upstream version/channel to mirror
+        id: version
+        env:
+          TRIGGER_EVENT_NAME: ${{ github.event.workflow_run.event || '' }}
+          TRIGGER_REF_NAME: ${{ github.event.workflow_run.head_branch || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${DISPATCH_VERSION:-next}"
+          else
+            # Reuse docker-publish.yml's own resolver so we mirror the exact
+            # same channel it just published (main / next / a release tag).
+            REF_TYPE="branch"
+            if git rev-parse -q --verify "refs/tags/${TRIGGER_REF_NAME}" >/dev/null 2>&1; then
+              REF_TYPE="tag"
+            fi
+            VERSION=$(bash scripts/ci/resolve-docker-publish-version.sh \
+              "$TRIGGER_EVENT_NAME" "$REF_TYPE" "$TRIGGER_REF_NAME" "" "$DEFAULT_BRANCH")
+          fi
+
+          if [ "$VERSION" = "skip" ]; then
+            echo "Nothing to mirror for this trigger (non-default release branch)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        if: steps.version.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: steps.version.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Mirror image into this fork's GHCR namespace (digest copy, no rebuild)
+        if: steps.version.outputs.skip != 'true'
+        id: mirror
+        env:
+          SRC: ghcr.io/diegosouzapw/omniroute:${{ steps.version.outputs.version }}
+          DST: ghcr.io/shermzy/omniroute:${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$DST" "$SRC"
+          DIGEST=$(docker buildx imagetools inspect "$DST" --format '{{json .Manifest}}' | jq -r '.digest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "::error::Could not resolve a manifest digest for $DST"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Mirrored $SRC -> $DST@$DIGEST"
+
+      - name: Patch Coolify service image
+        if: >-
+          steps.version.outputs.skip != 'true' &&
+          (github.event_name != 'workflow_dispatch' || inputs.deploy)
+        env:
+          COOLIFY_URL: ${{ secrets.COOLIFY_URL }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+          SERVICE_UUID: ${{ vars.COOLIFY_SERVICE_UUID }}
+          APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
+          IMAGE_REF: ghcr.io/shermzy/omniroute@${{ steps.mirror.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for v in COOLIFY_URL COOLIFY_API_TOKEN SERVICE_UUID APP_UUID; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::Missing required secret/variable: $v"
+              exit 1
+            fi
+          done
+
+          curl -sf -X PATCH \
+            "$COOLIFY_URL/api/v1/services/$SERVICE_UUID/applications/$APP_UUID" \
+            -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+            -H "User-Agent: omniroute-mirror-ci/1.0" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg image "$IMAGE_REF" '{image: $image}')"
+
+          echo "Patched image to $IMAGE_REF — restarting container…"
+          curl -sf -X POST \
+            "$COOLIFY_URL/api/v1/services/$SERVICE_UUID/applications/$APP_UUID/restart" \
+            -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+            -H "User-Agent: omniroute-mirror-ci/1.0"
