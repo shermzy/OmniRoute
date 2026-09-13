@@ -1,6 +1,6 @@
 # Chat On Steroids runtime for OmniRoute
 
-Status: **staged contract — not live until the CoS runtime ingress exists and passes the probe**.
+Status: **registration tooling is staged; live activation is gated on the CoS runtime ingress passing the probe**.
 
 This integration intentionally does **not** point OmniRoute at the existing Chat On Steroids browser bridge or MCP endpoint. Those endpoints have different identity and security semantics. Instead, CoS should expose one dedicated, authenticated OpenAI-compatible runtime listener that uses CoS's existing durable session/input machinery internally.
 
@@ -8,16 +8,21 @@ This integration intentionally does **not** point OmniRoute at the existing Chat
 
 ```text
 client
-  -> OmniRoute
-     -> OpenAI-compatible custom provider: chat-on-steroids
-        -> dedicated CoS runtime listener
+  -> OmniRoute model cos/default
+     -> OpenAI-compatible custom node (prefix: cos)
+        -> dedicated CoS runtime listener model default
            -> CoS sendDesktopInput()/durable outbox
               -> paired ChatGPT browser conversation
                  -> CoS recorder/session store
                     -> exact terminal assistant result
 ```
 
-The first version should advertise a single logical model, `cos/default`. That route means "use the model/reasoning selection owned by the dedicated CoS runtime session". Do not pretend every ChatGPT account/model is available through the runtime. Model-specific routing can be added only after CoS can prove the requested account-observed model was selected for that exact send.
+The first version has two model identities on purpose:
+
+- CoS upstream model id: `default`
+- OmniRoute public model id: `cos/default`
+
+The OmniRoute compatible-node prefix supplies `cos/`; CoS must not advertise a second `cos/` prefix itself. `default` means "use the model/reasoning selection owned by the dedicated CoS runtime session". Do not pretend every ChatGPT account/model is available through the runtime. Model-specific routing can be added only after CoS can prove the requested account-observed model was selected for that exact send.
 
 ## Required CoS ingress contract
 
@@ -33,7 +38,7 @@ COS_RUNTIME_TOKEN=<random high-entropy secret>
 COS_RUNTIME_SESSION_ID=<optional dedicated existing session id>
 ```
 
-If the OmniRoute host is not on the same machine, publish this listener only through an authenticated private tunnel/mesh. Do not bind an unauthenticated runtime listener to `0.0.0.0`.
+If the OmniRoute host is not on the same machine, publish this listener only through an operator-approved authenticated private tunnel/mesh or HTTPS endpoint. Do not bind an unauthenticated runtime listener to `0.0.0.0`, and do not globally weaken OmniRoute's private-upstream/SSRF guard merely to make this route work.
 
 ### `GET /healthz`
 
@@ -59,7 +64,7 @@ Initial response:
   "object": "list",
   "data": [
     {
-      "id": "cos/default",
+      "id": "default",
       "object": "model",
       "owned_by": "chat-on-steroids"
     }
@@ -67,13 +72,15 @@ Initial response:
 }
 ```
 
+OmniRoute discovers/imports this upstream `default` model under the node prefix `cos`, making the client-facing model `cos/default`.
+
 ### `POST /v1/chat/completions`
 
 Supported first-version request subset:
 
 ```json
 {
-  "model": "cos/default",
+  "model": "default",
   "messages": [
     { "role": "system", "content": "optional instructions" },
     { "role": "user", "content": "task" }
@@ -93,14 +100,14 @@ Initial implementation rules:
 7. If delivery becomes ambiguous after CoS has claimed the browser send, fail the API request without automatically replaying it. A replay could duplicate file edits or commands.
 8. Propagate cancellation to CoS only when CoS can prove cancellation belongs to the same request/input id.
 
-Successful response shape:
+Successful upstream response shape:
 
 ```json
 {
   "id": "chatcmpl-cos-<request-id>",
   "object": "chat.completion",
   "created": 0,
-  "model": "cos/default",
+  "model": "default",
   "choices": [
     {
       "index": 0,
@@ -115,31 +122,59 @@ Token usage may be omitted or returned as unknown until CoS has trustworthy requ
 
 ## Idempotency and concurrency
 
-A caller may send `Idempotency-Key`. CoS should persist the mapping from that key to its input/request id before browser delivery. Repeating a completed key returns the recorded result; repeating an in-flight key attaches to the same request. It must never create a second browser send.
+A caller may send `Idempotency-Key`. CoS should persist the mapping from that key to its input/request id before browser delivery. Repeating a completed key returns the same recorded completion id/result; repeating an in-flight key attaches to the same request. It must never create a second browser send.
 
 Start with concurrency **1 per dedicated CoS runtime session**. Additional parallelism should use separate CoS sessions and preserve their conversation/session identities independently.
 
-## OmniRoute configuration
+## Probe the CoS ingress
 
-Once the ingress passes the probe, add it as an OpenAI-compatible custom provider rather than modifying the built-in provider registry:
+Run this on a host that can reach the CoS runtime:
 
-```text
-Provider name: Chat On Steroids
-Base URL:      <private CoS runtime URL>/v1
-API key:       same secret as COS_RUNTIME_TOKEN
-Model:         cos/default
+```bash
+COS_RUNTIME_BASE_URL=http://127.0.0.1:8770 \
+COS_RUNTIME_TOKEN='...' \
+node scripts/chat-on-steroids/probe.mjs
 ```
 
-Keep the provider out of automatic fallback initially. Select `cos/default` explicitly until duplicate-send, disconnect, timeout, and cancellation tests pass.
+The probe checks authenticated health, `default` model discovery, an exact completion, and idempotent replay using the same completion id.
 
-The provider can join normal routing only after all acceptance tests below pass.
+## Register it in OmniRoute
+
+After the probe passes, register the runtime through OmniRoute's existing compatible-provider management APIs:
+
+```bash
+OMNIROUTE_BASE_URL=https://omni.t3.group \
+OMNIROUTE_MANAGEMENT_TOKEN='...' \
+COS_RUNTIME_BASE_URL='https://<operator-approved-cos-endpoint>' \
+COS_RUNTIME_TOKEN='...' \
+node scripts/chat-on-steroids/register.mjs
+```
+
+`register.mjs` is idempotent and deliberately conservative. It:
+
+1. Probes CoS health and verifies upstream model `default`.
+2. Reuses the exact `cos` provider node if it already targets the same CoS `/v1` endpoint.
+3. Refuses to hijack `cos` if that prefix already belongs to another node.
+4. Creates an OpenAI-compatible chat node with `/chat/completions` and `/models` paths only when necessary.
+5. Reuses the sole connection for that node or creates one with the CoS bearer token and upstream default model `default`.
+6. Runs OmniRoute's own connection test and imports the live model catalog.
+7. Leaves automatic fallback unchanged.
+
+On success it prints:
+
+```text
+READY: select cos/default in OmniRoute
+Automatic fallback was not modified.
+```
+
+If OmniRoute rejects the CoS base URL under its private-upstream/SSRF policy, publish CoS through an operator-approved reachable endpoint. Do **not** globally disable that protection.
 
 ## Acceptance tests
 
 1. **Health** — `/healthz` is authenticated and reports ready only when CoS can accept work.
 2. **Basic turn** — `Return exactly COS_RUNTIME_OK` returns one final answer and one CoS user input.
 3. **Session isolation** — two sequential requests are recorded under the intended dedicated runtime session without cross-session leakage.
-4. **No duplicate on lost response** — force a connection drop after CoS accepts the input; retry with the same idempotency key and verify there is still one native user message.
+4. **No duplicate on lost response** — force a connection drop after CoS accepts the input; retry with the same idempotency key and verify there is still one native user message and the same completion id.
 5. **Browser unavailable** — request queues/fails truthfully; OmniRoute does not receive a fabricated completion.
 6. **Timeout** — OmniRoute gets an error while CoS retains truthful request state; no automatic replay occurs.
 7. **Cancellation** — cancellation affects only the exact active runtime request.
@@ -149,6 +184,6 @@ The provider can join normal routing only after all acceptance tests below pass.
 
 ## Deployment gate for `omni.t3.group`
 
-The current fork deployment mirrors the upstream OmniRoute image into `ghcr.io/shermzy/omniroute` by digest. Therefore changes on this branch do not automatically alter the running OmniRoute service, and this integration deliberately needs no OmniRoute core rebuild for the first version.
+The current fork deployment mirrors the upstream OmniRoute image into `ghcr.io/shermzy/omniroute` by digest. Therefore changes on this branch do not automatically alter the running OmniRoute service. The first integration does not require an OmniRoute core rebuild: it uses the already-shipped custom-provider management surface.
 
-The live change is limited to adding the custom provider **after** the CoS runtime listener is reachable from the OmniRoute host and this repository's probe succeeds. Keep the existing OmniRoute image/routing unchanged until then.
+The live mutation is limited to adding the compatible provider node/connection **after** the CoS runtime listener is reachable from the OmniRoute host and the probe succeeds. Keep the existing routing unchanged until then.
