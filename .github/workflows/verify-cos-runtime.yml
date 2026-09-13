@@ -1,0 +1,55 @@
+name: Verify Chat On Steroids runtime patch
+
+on:
+  pull_request:
+    paths:
+      - 'docs/integrations/chat-on-steroids-runtime.md'
+      - 'scripts/chat-on-steroids/**'
+      - 'patches/chat-on-steroids-2.0.9/**'
+      - '.github/workflows/verify-cos-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout OmniRoute branch
+        uses: actions/checkout@v4
+        with:
+          path: omniroute
+
+      - name: Checkout pinned Chat On Steroids 2.0.9 source
+        uses: actions/checkout@v4
+        with:
+          repository: totec448-spec/chat-on-steroids
+          ref: 1517d66dac1e7452f63b7452c88479c92a554768
+          path: cos
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: cos/package-lock.json
+
+      - name: Install CoS dependencies
+        working-directory: cos
+        run: npm ci
+
+      - name: Apply staged runtime source
+        env:
+          COS_SOURCE_DIR: ${{ github.workspace }}/cos
+        run: node omniroute/scripts/chat-on-steroids/install-cos-source.mjs
+
+      - name: Typecheck CoS with runtime ingress
+        working-directory: cos
+        run: npm run typecheck
+
+      - name: Run CoS tests
+        working-directory: cos
+        run: npm test
