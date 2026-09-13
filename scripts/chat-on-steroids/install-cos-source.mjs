@@ -3,6 +3,7 @@
 import { readFile, writeFile, access } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 const cosDir = process.env.COS_SOURCE_DIR ? path.resolve(process.env.COS_SOURCE_DIR) : null;
 if (!cosDir) {
@@ -10,7 +11,7 @@ if (!cosDir) {
   process.exit(2);
 }
 
-const here = path.dirname(new URL(import.meta.url).pathname);
+const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
 const staged = path.join(repoRoot, 'patches', 'chat-on-steroids-2.0.9', 'src', 'main', 'runtime-server.ts');
 const target = path.join(cosDir, 'src', 'main', 'runtime-server.ts');
