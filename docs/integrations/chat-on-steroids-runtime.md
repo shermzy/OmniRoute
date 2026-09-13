@@ -1,8 +1,10 @@
 # Chat On Steroids runtime for OmniRoute
 
-Status: **registration tooling is staged; live activation is gated on the CoS runtime ingress passing the probe**.
+Status: **registration tooling and a CoS 2.1.0 source patch are staged; live activation is gated on verification and the runtime ingress passing the probe**.
 
-This integration intentionally does **not** point OmniRoute at the existing Chat On Steroids browser bridge or MCP endpoint. Those endpoints have different identity and security semantics. Instead, CoS should expose one dedicated, authenticated OpenAI-compatible runtime listener that uses CoS's existing durable session/input machinery internally.
+The staged CoS source is pinned to `totec448-spec/chat-on-steroids` commit `1517d66dac1e7452f63b7452c88479c92a554768` (package version 2.1.0).
+
+This integration intentionally does **not** point OmniRoute at the existing Chat On Steroids browser bridge or MCP endpoint. Those endpoints have different identity and security semantics. Instead, CoS gets one dedicated, authenticated OpenAI-compatible runtime listener that uses CoS's existing durable session/input machinery internally.
 
 ## Target topology
 
@@ -26,7 +28,7 @@ The OmniRoute compatible-node prefix supplies `cos/`; CoS must not advertise a s
 
 ## Required CoS ingress contract
 
-The listener must be a **new runtime surface** with its own bearer token. It must not weaken browser-pairing, MCP caller attribution, approved-root checks, or the browser bridge's loopback-only assumptions.
+The listener is a **new runtime surface** with its own bearer token. It must not weaken browser-pairing, MCP caller attribution, approved-root checks, or the browser bridge's loopback-only assumptions.
 
 Environment owned by CoS:
 
@@ -48,12 +50,12 @@ Authenticated health response:
 {
   "ok": true,
   "service": "chat-on-steroids-runtime",
-  "version": "2.0.9",
+  "version": "2.1.0",
   "ready": true
 }
 ```
 
-`ready` must be false unless CoS can accept a durable input. Browser/connector unavailability may be reported separately, but health must never claim a request was delivered merely because it was queued.
+`ready` must be false unless CoS can resolve/create its dedicated durable runtime session. Browser delivery still has its own truthful delivery state; health never claims a request was delivered merely because the listener exists.
 
 ### `GET /v1/models`
 
@@ -92,39 +94,32 @@ Supported first-version request subset:
 Initial implementation rules:
 
 1. Reject `stream: true` with a normal OpenAI-compatible 4xx error until CoS has a truthful streaming boundary.
-2. Flatten only supported text messages into one authored runtime request. Reject unsupported multimodal/tool payloads rather than silently dropping them.
+2. Flatten only supported text `system`/`user` messages into one authored runtime request. Reject unsupported multimodal/tool/assistant payloads rather than silently dropping them.
 3. Create a UUID request/input id and call the same `sendDesktopInput()` path used by explicit desktop sends. Do not write directly to the browser bridge.
-4. Use a dedicated CoS session, or create one through the existing session store. Reuse must be serialized at first (one active OmniRoute request per runtime session).
-5. After the durable input is accepted, wait for the exact turn associated with that input to reach a terminal `turn_end` and for its canonical assistant message to be final.
-6. Return only that exact assistant message. Interim prose, a queued input, a browser click, or an ambiguous ACK is not completion.
-7. If delivery becomes ambiguous after CoS has claimed the browser send, fail the API request without automatically replaying it. A replay could duplicate file edits or commands.
-8. Propagate cancellation to CoS only when CoS can prove cancellation belongs to the same request/input id.
-
-Successful upstream response shape:
-
-```json
-{
-  "id": "chatcmpl-cos-<request-id>",
-  "object": "chat.completion",
-  "created": 0,
-  "model": "default",
-  "choices": [
-    {
-      "index": 0,
-      "message": { "role": "assistant", "content": "..." },
-      "finish_reason": "stop"
-    }
-  ]
-}
-```
-
-Token usage may be omitted or returned as unknown until CoS has trustworthy request-level usage accounting.
+4. Use a dedicated CoS session, or create one through the existing session store. Reuse is serialized at first (one active OmniRoute request per runtime listener).
+5. After the durable input is accepted, correlate the canonical `user_message.inputId` to its exact `turnId`, require a matching completed `turn_end`, and return only the final assistant message for that turn.
+6. Resolve a truncated final message from its recorded asset rather than returning only the inline prefix.
+7. If delivery becomes ambiguous after CoS has published the durable send, preserve the idempotency reservation and fail rather than automatically replaying it. A replay could duplicate file edits or commands.
+8. Missing/wrong bearer tokens are rejected before any runtime input is created.
 
 ## Idempotency and concurrency
 
-A caller may send `Idempotency-Key`. CoS should persist the mapping from that key to its input/request id before browser delivery. Repeating a completed key returns the same recorded completion id/result; repeating an in-flight key attaches to the same request. It must never create a second browser send.
+A caller may send `Idempotency-Key`. CoS hashes the key before durable storage. A completed key returns the same recorded completion id/result. An in-flight or ambiguous key returns conflict and must never create a second browser send.
 
-Start with concurrency **1 per dedicated CoS runtime session**. Additional parallelism should use separate CoS sessions and preserve their conversation/session identities independently.
+The first version serializes runtime requests. Additional parallelism should use separate explicitly-owned CoS sessions and preserve conversation/session identities independently.
+
+## Apply the staged CoS 2.1.0 source
+
+From this OmniRoute branch, point the installer at a **writable** CoS 2.1.0 checkout:
+
+```bash
+COS_SOURCE_DIR=/path/to/chat-on-steroids \
+node scripts/chat-on-steroids/install-cos-source.mjs
+```
+
+The installer validates package version 2.1.0, refuses to overwrite a different existing `runtime-server.ts`, and patches three exact `src/main/index.ts` anchors for import/start/shutdown. CI applies the same installer to pinned commit `1517d66dac1e7452f63b7452c88479c92a554768` and runs CoS typecheck/tests.
+
+Then build/package/install CoS through its normal release path with the runtime environment variables above.
 
 ## Probe the CoS ingress
 
@@ -171,16 +166,16 @@ If OmniRoute rejects the CoS base URL under its private-upstream/SSRF policy, pu
 
 ## Acceptance tests
 
-1. **Health** — `/healthz` is authenticated and reports ready only when CoS can accept work.
+1. **Health** — `/healthz` is authenticated and reports ready only when the durable runtime session is available.
 2. **Basic turn** — `Return exactly COS_RUNTIME_OK` returns one final answer and one CoS user input.
-3. **Session isolation** — two sequential requests are recorded under the intended dedicated runtime session without cross-session leakage.
-4. **No duplicate on lost response** — force a connection drop after CoS accepts the input; retry with the same idempotency key and verify there is still one native user message and the same completion id.
-5. **Browser unavailable** — request queues/fails truthfully; OmniRoute does not receive a fabricated completion.
-6. **Timeout** — OmniRoute gets an error while CoS retains truthful request state; no automatic replay occurs.
-7. **Cancellation** — cancellation affects only the exact active runtime request.
-8. **Tool side effects** — run a harmless workspace task and verify it executes exactly once.
-9. **Unsupported payload** — tool calls, images, or streaming are rejected until explicitly implemented.
-10. **Authentication** — missing/wrong bearer token returns 401 and never creates a CoS input.
+3. **Session isolation** — sequential requests are recorded under the intended dedicated runtime session without cross-session leakage.
+4. **No duplicate on lost response** — force a connection drop after CoS accepts the input; retry with the same idempotency key and verify there is still one native user message and no second send.
+5. **Browser unavailable** — request fails/queues truthfully; OmniRoute does not receive a fabricated completion.
+6. **Timeout** — OmniRoute gets an error while CoS retains ambiguous request state; no automatic replay occurs.
+7. **Tool side effects** — run a harmless workspace task and verify it executes exactly once.
+8. **Unsupported payload** — tool calls, images, assistant-history payloads, or streaming are rejected until explicitly implemented.
+9. **Authentication** — missing/wrong bearer token returns 401 and never creates a CoS input.
+10. **Static verification** — the pinned CoS tree passes typecheck and its test suite after the staged source is applied.
 
 ## Deployment gate for `omni.t3.group`
 
