@@ -1,0 +1,367 @@
+diff --git a/src/main/runtime-server.ts b/src/main/runtime-server.ts
+new file mode 100644
+--- /dev/null
++++ b/src/main/runtime-server.ts
+@@ -0,0 +1,330 @@
++import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
++import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
++import { readDurable, writeDurableNow } from './durable.js';
++import { logInfo, logWarn } from './logger.js';
++import { listInputs } from './session/input.js';
++import { sendDesktopInput } from './session/start-input.js';
++import { createSession, getSession, readAsset, readRecentEvents } from './session/store.js';
++import type { SessionEvent, StoredText } from '../shared/session.js';
++
++const STATE = 'cos-runtime';
++const MODEL = 'default';
++const MAX_BODY_BYTES = 1024 * 1024;
++const REQUEST_TIMEOUT_MS = 15 * 60_000;
++const COMPLETE_TTL_MS = 24 * 60 * 60_000;
++
++type Completion = {
++  id: string;
++  object: 'chat.completion';
++  created: number;
++  model: typeof MODEL;
++  choices: Array<{
++    index: 0;
++    message: { role: 'assistant'; content: string };
++    finish_reason: 'stop';
++  }>;
++};
++
++type RuntimeRequest = {
++  inputId: string;
++  status: 'inflight' | 'complete' | 'ambiguous';
++  createdAt: number;
++  updatedAt: number;
++  response?: Completion;
++  error?: string;
++};
++
++type RuntimeState = {
++  sessionId?: string;
++  requests: Record<string, RuntimeRequest>;
++};
++
++class HttpError extends Error {
++  constructor(readonly status: number, message: string, readonly code = 'runtime_error') {
++    super(message);
++  }
++}
++
++let server: Server | null = null;
++let chain: Promise<unknown> = Promise.resolve();
++
++function serialize<T>(work: () => Promise<T>): Promise<T> {
++  const next = chain.then(work, work);
++  chain = next.catch(() => undefined);
++  return next;
++}
++
++function enabled(): boolean {
++  return process.env.COS_RUNTIME_ENABLED?.trim().toLowerCase() === 'true';
++}
++
++function bearerToken(): string {
++  return process.env.COS_RUNTIME_TOKEN?.trim() ?? '';
++}
++
++function authorized(request: IncomingMessage): boolean {
++  const expected = bearerToken();
++  const value = request.headers.authorization ?? '';
++  const presented = value.startsWith('Bearer ') ? value.slice(7) : '';
++  if (!expected || !presented) return false;
++  const left = Buffer.from(expected);
++  const right = Buffer.from(presented);
++  return left.length === right.length && timingSafeEqual(left, right);
++}
++
++function json(response: ServerResponse, status: number, body: unknown): void {
++  const encoded = Buffer.from(JSON.stringify(body));
++  response.writeHead(status, {
++    'content-type': 'application/json; charset=utf-8',
++    'content-length': String(encoded.byteLength),
++    'cache-control': 'no-store'
++  });
++  response.end(encoded);
++}
++
++function apiError(response: ServerResponse, status: number, message: string, code = 'runtime_error'): void {
++  json(response, status, { error: { message, type: code, code } });
++}
++
++async function bodyJson(request: IncomingMessage): Promise<Record<string, unknown>> {
++  const chunks: Buffer[] = [];
++  let total = 0;
++  for await (const raw of request) {
++    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
++    total += chunk.length;
++    if (total > MAX_BODY_BYTES) throw new HttpError(413, 'Request body is too large', 'request_too_large');
++    chunks.push(chunk);
++  }
++  try {
++    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
++    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('object required');
++    return parsed as Record<string, unknown>;
++  } catch {
++    throw new HttpError(400, 'Invalid JSON body', 'invalid_request_error');
++  }
++}
++
++async function loadState(): Promise<RuntimeState> {
++  const raw = await readDurable<RuntimeState>(STATE);
++  if (!raw || typeof raw !== 'object' || !raw.requests || typeof raw.requests !== 'object') {
++    return { requests: {} };
++  }
++  return raw;
++}
++
++function pruneCompleted(state: RuntimeState): RuntimeState {
++  const cutoff = Date.now() - COMPLETE_TTL_MS;
++  const requests = Object.fromEntries(
++    Object.entries(state.requests).filter(([, entry]) => entry.status !== 'complete' || entry.updatedAt >= cutoff)
++  );
++  return { ...state, requests };
++}
++
++async function saveState(state: RuntimeState): Promise<void> {
++  await writeDurableNow(STATE, pruneCompleted(state));
++}
++
++async function ensureSession(state: RuntimeState): Promise<string> {
++  const explicit = process.env.COS_RUNTIME_SESSION_ID?.trim();
++  if (explicit) {
++    if (!await getSession(explicit)) throw new HttpError(503, 'COS_RUNTIME_SESSION_ID does not exist', 'runtime_not_ready');
++    return explicit;
++  }
++  if (state.sessionId && await getSession(state.sessionId)) return state.sessionId;
++  const created = await createSession({ title: 'OmniRoute Runtime', conversationId: null });
++  state.sessionId = created.id;
++  await saveState(state);
++  return created.id;
++}
++
++function idempotencyDigest(request: IncomingMessage): string {
++  const supplied = request.headers['idempotency-key'];
++  const raw = typeof supplied === 'string' && supplied.trim() ? supplied.trim() : randomUUID();
++  return createHash('sha256').update(raw).digest('hex');
++}
++
++function flattenMessages(body: Record<string, unknown>): string {
++  if (body.model !== MODEL) throw new HttpError(400, `Only model ${MODEL} is supported`, 'model_not_found');
++  if (body.stream === true) throw new HttpError(400, 'Streaming is not supported yet', 'unsupported_feature');
++  if (body.tools !== undefined || body.tool_choice !== undefined) {
++    throw new HttpError(400, 'Tool payloads are not supported by the CoS runtime ingress', 'unsupported_feature');
++  }
++  if (!Array.isArray(body.messages) || body.messages.length === 0) {
++    throw new HttpError(400, 'messages must be a non-empty array', 'invalid_request_error');
++  }
++  const lines: string[] = [];
++  for (const item of body.messages) {
++    if (!item || typeof item !== 'object' || Array.isArray(item)) {
++      throw new HttpError(400, 'Every message must be an object', 'invalid_request_error');
++    }
++    const message = item as Record<string, unknown>;
++    if (message.role !== 'system' && message.role !== 'user') {
++      throw new HttpError(400, `Unsupported message role: ${String(message.role)}`, 'unsupported_feature');
++    }
++    if (typeof message.content !== 'string') {
++      throw new HttpError(400, 'Only text message content is supported', 'unsupported_feature');
++    }
++    lines.push(`${message.role === 'system' ? 'System' : 'User'}:\n${message.content}`);
++  }
++  if (!body.messages.some((item) => (item as { role?: unknown })?.role === 'user')) {
++    throw new HttpError(400, 'At least one user message is required', 'invalid_request_error');
++  }
++  return lines.join('\n\n').trim();
++}
++
++async function storedText(sessionId: string, value: StoredText): Promise<string> {
++  if (!value.truncated || !value.assetId) return value.text;
++  const asset = await readAsset(sessionId, value.assetId, 8 * 1024 * 1024);
++  return asset ? asset.toString('utf8') : value.text;
++}
++
++function newest<T extends SessionEvent>(events: T[]): T | undefined {
++  return [...events].sort((a, b) => a.seq - b.seq).at(-1);
++}
++
++async function waitForCompletion(sessionId: string, inputId: string): Promise<string> {
++  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
++  let turnId: string | undefined;
++  while (Date.now() < deadline) {
++    const events = await readRecentEvents(sessionId, 1024, {
++      kinds: ['user_message', 'assistant_message', 'turn_end'],
++      maxBytes: 8 * 1024 * 1024
++    });
++    const user = newest(events.filter((event): event is Extract<SessionEvent, { kind: 'user_message' }> =>
++      event.kind === 'user_message' && event.inputId === inputId));
++    turnId = turnId ?? user?.turnId;
++    if (turnId) {
++      const end = newest(events.filter((event): event is Extract<SessionEvent, { kind: 'turn_end' }> =>
++        event.kind === 'turn_end' && event.turnId === turnId));
++      if (end) {
++        if (end.outcome !== 'completed') {
++          throw new Error(`ChatGPT turn ${turnId} ended as ${end.outcome}${end.detail ? `: ${end.detail}` : ''}`);
++        }
++        const assistant = newest(events.filter((event): event is Extract<SessionEvent, { kind: 'assistant_message' }> =>
++          event.kind === 'assistant_message' && event.turnId === turnId && (event.final === true || event.state === 'final')));
++        if (assistant) return storedText(sessionId, assistant.message);
++      }
++    }
++
++    const entry = (await listInputs()).find((candidate) => candidate.id === inputId);
++    if (entry?.state === 'failed' || entry?.state === 'cancelled') {
++      throw new Error(entry.error || `Input ${entry.state}`);
++    }
++    await new Promise(resolve => setTimeout(resolve, 750));
++  }
++  throw new Error(`Timed out waiting for the exact terminal turn after ${REQUEST_TIMEOUT_MS}ms`);
++}
++
++async function completion(request: IncomingMessage, body: Record<string, unknown>): Promise<Completion> {
++  const text = flattenMessages(body);
++  const key = idempotencyDigest(request);
++  const state = await loadState();
++  const previous = state.requests[key];
++  if (previous?.status === 'complete' && previous.response) return previous.response;
++  if (previous?.status === 'inflight' || previous?.status === 'ambiguous') {
++    throw new HttpError(409, 'This idempotency key already owns an in-flight or ambiguous send; refusing to replay it', 'request_ambiguous');
++  }
++
++  const sessionId = await ensureSession(state);
++  const inputId = randomUUID();
++  state.requests[key] = { inputId, status: 'inflight', createdAt: Date.now(), updatedAt: Date.now() };
++  await saveState(state);
++
++  try {
++    await sendDesktopInput({
++      id: inputId,
++      sessionId,
++      text,
++      mode: 'auto',
++      dueAt: Date.now(),
++      model: null,
++      reasoningEffort: null
++    });
++  } catch (error) {
++    // sendDesktopInput throws only before durable publication; after enqueue, its durable
++    // outbox owns the request. Removing this reservation is therefore safe only here.
++    const current = await loadState();
++    delete current.requests[key];
++    await saveState(current);
++    throw error;
++  }
++
++  try {
++    const answer = await waitForCompletion(sessionId, inputId);
++    const response: Completion = {
++      id: `chatcmpl-cos-${inputId}`,
++      object: 'chat.completion',
++      created: Math.floor(Date.now() / 1000),
++      model: MODEL,
++      choices: [{ index: 0, message: { role: 'assistant', content: answer }, finish_reason: 'stop' }]
++    };
++    const current = await loadState();
++    current.requests[key] = { ...current.requests[key]!, status: 'complete', updatedAt: Date.now(), response };
++    await saveState(current);
++    return response;
++  } catch (error) {
++    // Once publication succeeded, a missing/late ACK is ambiguous. Preserve the reservation
++    // and refuse automatic replay under the same key: the browser may already have executed it.
++    const current = await loadState();
++    current.requests[key] = {
++      ...current.requests[key]!,
++      status: 'ambiguous',
++      updatedAt: Date.now(),
++      error: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500)
++    };
++    await saveState(current);
++    throw error;
++  }
++}
++
++async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
++  if (!authorized(request)) return apiError(response, 401, 'Unauthorized', 'invalid_api_key');
++  const url = new URL(request.url ?? '/', 'http://runtime.local');
++  if (request.method === 'GET' && url.pathname === '/healthz') {
++    return json(response, 200, { ok: true, service: 'chat-on-steroids-runtime', version: '2.0.9', ready: true });
++  }
++  if (request.method === 'GET' && url.pathname === '/v1/models') {
++    return json(response, 200, { object: 'list', data: [{ id: MODEL, object: 'model', owned_by: 'chat-on-steroids' }] });
++  }
++  if (request.method === 'POST' && url.pathname === '/v1/chat/completions') {
++    try {
++      const body = await bodyJson(request);
++      const result = await serialize(() => completion(request, body));
++      return json(response, 200, result);
++    } catch (error) {
++      const status = error instanceof HttpError ? error.status : 500;
++      const code = error instanceof HttpError ? error.code : 'runtime_error';
++      const message = error instanceof Error ? error.message : 'Runtime request failed';
++      return apiError(response, status, message, code);
++    }
++  }
++  apiError(response, 404, 'Not found', 'not_found');
++}
++
++export async function startRuntimeServer(): Promise<boolean> {
++  if (!enabled()) return false;
++  if (server) return true;
++  if (!bearerToken()) throw new Error('COS_RUNTIME_TOKEN is required when COS_RUNTIME_ENABLED=true');
++  const host = process.env.COS_RUNTIME_HOST?.trim() || '127.0.0.1';
++  const port = Number.parseInt(process.env.COS_RUNTIME_PORT || '8770', 10);
++  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('COS_RUNTIME_PORT must be 1-65535');
++  const next = createServer((request, response) => {
++    void handle(request, response).catch(error => {
++      logWarn(`runtime request: ${error instanceof Error ? error.message : String(error)}`);
++      if (!response.headersSent) apiError(response, 500, 'Runtime request failed'); else response.end();
++    });
++  });
++  await new Promise<void>((resolve, reject) => {
++    next.once('error', reject);
++    next.listen(port, host, () => { next.off('error', reject); resolve(); });
++  });
++  server = next;
++  logInfo(`CoS runtime listening on ${host}:${port}`);
++  return true;
++}
++
++export async function shutdownRuntimeServer(): Promise<void> {
++  const current = server;
++  server = null;
++  if (!current) return;
++  await new Promise<void>((resolve) => current.close(() => resolve()));
++}
++diff --git a/src/main/index.ts b/src/main/index.ts
++--- a/src/main/index.ts
+++++ b/src/main/index.ts
++@@ -8,6 +8,7 @@ import { getConfig, initConfigPath, loadConfig } from './config.js';
++ import { connect, disconnect, getStatus, onStatusChange, shutdownConnection } from './connection.js';
++ import { registerIpc } from './ipc.js';
++ import { getChatModels, restoreChatModels, startChatModelDiscovery } from './chat-models.js';
+++import { shutdownRuntimeServer, startRuntimeServer } from './runtime-server.js';
++ import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, snapshotLogOnCrash } from './logger.js';
++ import { unifiedExecManager } from './codex/manager.js';
++ import { initSecretsPath } from './secrets.js';
++@@ -428,6 +429,10 @@ void app.whenReady().then(async () => {
++ 
++   logInfo('app started');
++ 
+++  try { await startRuntimeServer(); }
+++  catch (error) { logError(`CoS runtime failed to start: ${error instanceof Error ? error.message : String(error)}`); }
+++  if (windowActivation.isDisabled()) return;
+++
++   // Historical Unattributed repair may legitimately scan and rewrite a large legacy bucket.
++   // It is maintenance, not a prerequisite for showing the app or accepting new exact-id
++   // traffic, so never make startup/reload wait behind years of old session history.
++@@ -500,7 +505,7 @@ app.on('will-quit', (event) => {
++       // The budget has to clear the drains it contains, or it would silently defeat them:
++       // the bridge force-closes wedged localhost sockets at 15s and the MCP endpoint forces
++       // its own drain at 30s. This is the outer bound on both, not a competing one.
++-      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge()] },
+++      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownRuntimeServer(), shutdownConnection(), shutdownBridge()] },
++       // Phase 2: only after request handlers are done may their owned child processes go.
++       {
++         name: 'process cleanup',
