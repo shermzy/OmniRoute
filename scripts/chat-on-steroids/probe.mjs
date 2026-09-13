@@ -2,6 +2,7 @@
 
 const baseUrl = (process.env.COS_RUNTIME_BASE_URL || "").replace(/\/$/, "");
 const token = process.env.COS_RUNTIME_TOKEN || "";
+const model = (process.env.COS_RUNTIME_MODEL || "default").trim();
 
 if (!baseUrl) {
   console.error("COS_RUNTIME_BASE_URL is required, e.g. http://127.0.0.1:8770");
@@ -9,6 +10,10 @@ if (!baseUrl) {
 }
 if (!token) {
   console.error("COS_RUNTIME_TOKEN is required");
+  process.exit(2);
+}
+if (!model || model.includes("/")) {
+  console.error("COS_RUNTIME_MODEL must be an upstream model id without an OmniRoute prefix (default: default)");
   process.exit(2);
 }
 
@@ -50,21 +55,22 @@ if (health?.ready !== true) {
 console.log(`health: ok (version=${health.version ?? "unknown"})`);
 
 const models = await checked("/v1/models");
-const ids = Array.isArray(models?.data) ? models.data.map((model) => model?.id) : [];
-if (!ids.includes("cos/default")) {
-  throw new Error(`cos/default missing from model list: ${JSON.stringify(ids)}`);
+const ids = Array.isArray(models?.data) ? models.data.map((entry) => entry?.id) : [];
+if (!ids.includes(model)) {
+  throw new Error(`${model} missing from model list: ${JSON.stringify(ids)}`);
 }
-console.log("models: cos/default present");
+console.log(`models: ${model} present`);
 
 const idem = `omniroute-cos-probe-${Date.now()}`;
+const body = JSON.stringify({
+  model,
+  stream: false,
+  messages: [{ role: "user", content: "Return exactly COS_RUNTIME_OK" }],
+});
 const completion = await checked("/v1/chat/completions", {
   method: "POST",
   headers: { "idempotency-key": idem },
-  body: JSON.stringify({
-    model: "cos/default",
-    stream: false,
-    messages: [{ role: "user", content: "Return exactly COS_RUNTIME_OK" }],
-  }),
+  body,
 });
 const answer = completion?.choices?.[0]?.message?.content;
 if (answer !== "COS_RUNTIME_OK") {
@@ -75,15 +81,14 @@ console.log("completion: COS_RUNTIME_OK");
 const replay = await checked("/v1/chat/completions", {
   method: "POST",
   headers: { "idempotency-key": idem },
-  body: JSON.stringify({
-    model: "cos/default",
-    stream: false,
-    messages: [{ role: "user", content: "Return exactly COS_RUNTIME_OK" }],
-  }),
+  body,
 });
 const replayAnswer = replay?.choices?.[0]?.message?.content;
 if (replayAnswer !== "COS_RUNTIME_OK") {
   throw new Error(`Idempotent replay mismatch: ${JSON.stringify(replay)}`);
 }
-console.log("idempotency: replay returned same logical result");
+if (replay?.id !== completion?.id) {
+  throw new Error(`Idempotent replay created a different completion id: ${completion?.id} -> ${replay?.id}`);
+}
+console.log("idempotency: replay returned the same completion id/result");
 console.log("probe: PASS");
