@@ -117,7 +117,7 @@ COS_SOURCE_DIR=/path/to/chat-on-steroids \
 node scripts/chat-on-steroids/install-cos-source.mjs
 ```
 
-The installer validates package version 2.1.0, refuses to overwrite a different existing `runtime-server.ts`, and patches three exact `src/main/index.ts` anchors for import/start/shutdown. CI applies the same installer to pinned commit `1517d66dac1e7452f63b7452c88479c92a554768` and runs CoS typecheck/tests.
+The installer validates package version 2.1.0, refuses to overwrite a different existing `runtime-server.ts`, and patches three exact `src/main/index.ts` anchors for import/start/shutdown. CI applies the same installer to pinned commit `1517d66dac1e7452f63b7452c88479c92a554768`, confirms its pre-existing `search.test.ts` `filesScanned` baseline failure before patching, asserts that only `src/main/index.ts` and `src/main/runtime-server.ts` change, typechecks the patched tree, and runs every other upstream test.
 
 Then build/package/install CoS through its normal release path with the runtime environment variables above.
 
@@ -175,7 +175,7 @@ If OmniRoute rejects the CoS base URL under its private-upstream/SSRF policy, pu
 7. **Tool side effects** — run a harmless workspace task and verify it executes exactly once.
 8. **Unsupported payload** — tool calls, images, assistant-history payloads, or streaming are rejected until explicitly implemented.
 9. **Authentication** — missing/wrong bearer token returns 401 and never creates a CoS input.
-10. **Static verification** — the pinned CoS tree passes typecheck and its test suite after the staged source is applied.
+10. **Static verification** — the pinned CoS tree's known `search.test.ts` baseline is established before patching; the runtime patch is scope-checked, typechecked, and the unaffected upstream suite passes.
 
 ## Deployment gate for `omni.t3.group`
 
