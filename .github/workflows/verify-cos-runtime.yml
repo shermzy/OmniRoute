@@ -37,6 +37,12 @@ jobs:
           cache: npm
           cache-dependency-path: cos/package-lock.json
 
+      - name: Install test runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
+
       - name: Install CoS dependencies
         working-directory: cos
         run: npm ci
