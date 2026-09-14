@@ -85,6 +85,6 @@ jobs:
         working-directory: cos
         run: npm run typecheck
 
-      - name: Run unaffected CoS suite
+      - name: Run CoS suite except proven baseline assertion
         working-directory: cos
-        run: npm test -- --exclude test/search.test.ts
+        run: npm test -- --testNamePattern='^(?!.*counts files it searched, not files that matched).*$'
