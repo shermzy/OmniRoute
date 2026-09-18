@@ -1,4 +1,4 @@
-name: Inspect published OmniRoute OpenCode bundle
+name: Build, smoke, and deploy OpenCode free hotfix
 
 on:
   push:
@@ -7,73 +7,265 @@ on:
 
 permissions:
   contents: read
+  packages: write
+
+env:
+  BASE_IMAGE: ghcr.io/diegosouzapw/omniroute@sha256:80eade3c516c4b4e0b9ab07a72a96648155722fbf311cfb4bc058cc4d1e18b3a
+  IMAGE_TAG: ghcr.io/shermzy/omniroute:opencode-hotfix-20260918
 
 jobs:
-  probe:
+  hotfix:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe current OpenCode free-tier contract
+      - name: Checkout hotfix branch
+        uses: actions/checkout@v4
+
+      - name: Prove anonymous OpenCode contract directly
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, subprocess, tempfile, os
+          import json, os, secrets, subprocess, tempfile, time
 
-          models = [
-            "mimo-v2.5-free",
-            "big-pickle",
-            "nemotron-3-ultra-free",
-          ]
-          tools = ["_noop", "read", "bash", "grep", "glob", "write", "edit"]
-          url = "https://opencode.ai/zen/v1/chat/completions"
-          base_headers = [
-            "Content-Type: application/json",
-            "Accept: text/event-stream",
-            "User-Agent: opencode/1.18.31",
-            "x-opencode-client: desktop",
-            "x-opencode-project: global",
-            "x-opencode-session: ses_abcdef123456abcdefghijklmn",
-            "x-opencode-request: msg_abcdef123456abcdefghijklmn",
-            "Authorization: Bearer public",
-          ]
+          chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+          def identifier(prefix):
+              current = int(time.time() * 1000) * 0x1000 + 1
+              value = (~current) & ((1 << 48) - 1)
+              head = value.to_bytes(6, "big").hex()
+              tail = "".join(chars[b % 62] for b in secrets.token_bytes(14))
+              return prefix + head + tail
 
-          for model in models:
-            print(f"=== MODEL {model} ===")
-            success = False
-            for tool in tools:
-              payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": "Reply with exactly OK."}],
-                "stream": True,
-                "tools": [{
+          payload = {
+              "model": "mimo-v2.5-free",
+              "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+              "stream": True,
+              "tools": [{
                   "type": "function",
                   "function": {
-                    "name": tool,
-                    "description": "Compatibility placeholder. Do not call.",
-                    "parameters": {"type": "object", "properties": {}},
+                      "name": "_noop",
+                      "description": "Compatibility placeholder. Do not call.",
+                      "parameters": {"type": "object", "properties": {}},
                   },
-                }],
-              }
-              fd, path = tempfile.mkstemp()
-              os.close(fd)
-              cmd = ["curl","-sS","--max-time","35","-o",path,"-w","%{http_code}",url]
-              for h in base_headers:
-                cmd += ["-H", h]
-              cmd += ["--data-binary", json.dumps(payload)]
-              try:
-                p = subprocess.run(cmd, text=True, capture_output=True, timeout=40)
-                status = p.stdout.strip()[-3:] if p.stdout.strip() else "000"
-                body = open(path, "r", encoding="utf-8", errors="replace").read(1200)
-              except Exception as e:
-                status = "ERR"
-                body = str(e)
-              finally:
-                try: os.unlink(path)
-                except OSError: pass
-              summary = " ".join(body.split())[:700]
-              print(f"tool={tool} status={status} body={summary}")
-              if status == "200":
-                success = True
-                break
-            print(f"RESULT model={model} success={str(success).lower()}")
+              }],
+          }
+          headers = [
+              "Content-Type: application/json",
+              "Accept: text/event-stream",
+              "Authorization: Bearer public",
+              "User-Agent: opencode/1.18.31",
+              "x-opencode-client: desktop",
+              "x-opencode-project: global",
+              "x-opencode-session: " + identifier("ses_"),
+              "x-opencode-request: " + identifier("msg_"),
+          ]
+
+          fd, path = tempfile.mkstemp()
+          os.close(fd)
+          cmd = [
+              "curl", "-sS", "--max-time", "45",
+              "-o", path, "-w", "%{http_code}",
+              "https://opencode.ai/zen/v1/chat/completions",
+          ]
+          for h in headers:
+              cmd += ["-H", h]
+          cmd += ["--data-binary", json.dumps(payload)]
+          p = subprocess.run(cmd, text=True, capture_output=True, timeout=50)
+          status = p.stdout.strip()[-3:] if p.stdout.strip() else "000"
+          body = open(path, "r", encoding="utf-8", errors="replace").read(1600)
+          os.unlink(path)
+          print("direct_upstream_status=" + status)
+          print("direct_upstream_preview=" + " ".join(body.split())[:1000])
+          if status != "200":
+              raise SystemExit("OpenCode direct contract probe failed; refusing to build/deploy")
           PY
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pinned base image
+        run: docker pull "$BASE_IMAGE"
+
+      - name: Extract and patch compiled OpenCode executor
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .hotfix
+          CID="$(docker create "$BASE_IMAGE")"
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          docker cp "$CID:/app/.build/next/server/chunks/45782.js" .hotfix/45782.js
+          docker rm -f "$CID" >/dev/null
+          trap - EXIT
+          node scripts/ad-hoc/opencode-free-runtime-hotfix.cjs .hotfix/45782.js
+          sha256sum .hotfix/45782.js
+
+      - name: Build one-layer hotfix image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > .hotfix/Dockerfile <<EOF
+          FROM ${BASE_IMAGE}
+          USER root
+          COPY 45782.js /app/.build/next/server/chunks/45782.js
+          RUN chown node:node /app/.build/next/server/chunks/45782.js
+          USER node
+          EOF
+          docker build -f .hotfix/Dockerfile -t "$IMAGE_TAG" .hotfix
+
+      - name: Smoke test patched OmniRoute locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker logs --tail 180 omniroute-hotfix 2>/dev/null || true
+            docker rm -f omniroute-hotfix >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run -d --name omniroute-hotfix \
+            -p 127.0.0.1:20128:20128 \
+            -e REQUIRE_API_KEY=false \
+            -e OPENCODE_SYNTHESIZE_CLI_HEADERS=true \
+            "$IMAGE_TAG"
+
+          healthy=0
+          for i in $(seq 1 90); do
+            if curl -fsS --max-time 3 http://127.0.0.1:20128/healthz >/dev/null; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$healthy" != "1" ]; then
+            echo "::error::local hotfix container never became healthy"
+            exit 1
+          fi
+
+          curl -fsS --max-time 10 http://127.0.0.1:20128/v1/models > /tmp/models.json || true
+          python3 - <<'PY'
+          import json
+          try:
+              obj=json.load(open("/tmp/models.json"))
+              ids=[x.get("id","") for x in obj.get("data",[]) if isinstance(x,dict)]
+              print("local_models_opencode=" + ",".join(x for x in ids if "mimo-v2.5-free" in x)[:1200])
+          except Exception as e:
+              print("model_list_parse_warning=" + str(e))
+          PY
+
+          success=0
+          for model in oc/mimo-v2.5-free opencode/mimo-v2.5-free; do
+            rm -f /tmp/chat.body
+            status="$(curl -sS -N --max-time 120 \
+              -o /tmp/chat.body -w '%{http_code}' \
+              http://127.0.0.1:20128/v1/chat/completions \
+              -H 'Content-Type: application/json' \
+              --data-binary "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly OK.\"}],\"stream\":true}")" || status="000"
+            echo "local_smoke_model=$model status=$status"
+            head -c 2000 /tmp/chat.body | tr '\n' ' ' || true
+            echo
+            if [ "$status" = "200" ] && grep -q 'data:' /tmp/chat.body; then
+              success=1
+              break
+            fi
+          done
+          if [ "$success" != "1" ]; then
+            echo "::error::patched OmniRoute did not complete an OpenCode free request"
+            exit 1
+          fi
+
+          docker rm -f omniroute-hotfix >/dev/null
+          trap - EXIT
+
+      - name: Push verified image
+        id: push
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_TAG"
+          DIGEST="$(docker buildx imagetools inspect "$IMAGE_TAG" --format '{{json .Manifest}}' | jq -r '.digest')"
+          test -n "$DIGEST"
+          test "$DIGEST" != "null"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "verified_image=ghcr.io/shermzy/omniroute@$DIGEST"
+
+      - name: Patch and restart Coolify OmniRoute service
+        env:
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+          SERVICE_UUID: ${{ vars.COOLIFY_SERVICE_UUID }}
+          APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          COOLIFY_URL="https://t3ai.xyz"
+          for v in COOLIFY_API_TOKEN SERVICE_UUID APP_UUID DIGEST; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::Missing required deployment value: $v"
+              exit 1
+            fi
+          done
+          IMAGE_REF="ghcr.io/shermzy/omniroute@$DIGEST"
+
+          current="$(curl -fsS \
+            -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+            -H 'Accept: application/json' \
+            "$COOLIFY_URL/api/v1/services/$SERVICE_UUID/applications/$APP_UUID")"
+          echo "coolify_target_name=$(echo "$current" | jq -r '.name // .uuid // "unknown"')"
+          echo "coolify_previous_image=$(echo "$current" | jq -r '.image // "unknown"')"
+
+          curl -fsS -X PATCH \
+            -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json' \
+            "$COOLIFY_URL/api/v1/services/$SERVICE_UUID/applications/$APP_UUID" \
+            -d "$(jq -n --arg image "$IMAGE_REF" '{image:$image}')" >/tmp/coolify-patch.json
+
+          echo "coolify_patched_image=$IMAGE_REF"
+
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+            -H 'Accept: application/json' \
+            "$COOLIFY_URL/api/v1/services/$SERVICE_UUID/applications/$APP_UUID/restart" \
+            >/tmp/coolify-restart.json
+
+      - name: Verify public service and optional authenticated OpenCode call
+        env:
+          LIVE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          healthy=0
+          for i in $(seq 1 120); do
+            status="$(curl -sS --max-time 5 -o /tmp/health.body -w '%{http_code}' https://omni.t3.group/healthz || true)"
+            if [ "$status" = "200" ]; then
+              healthy=1
+              break
+            fi
+            sleep 3
+          done
+          echo "public_health_status=$(cat /tmp/health.body 2>/dev/null | head -c 300 || true)"
+          if [ "$healthy" != "1" ]; then
+            echo "::error::omni.t3.group did not become healthy after restart"
+            exit 1
+          fi
+
+          if [ -n "${LIVE_API_KEY:-}" ]; then
+            status="$(curl -sS -N --max-time 120 \
+              -o /tmp/live-chat.body -w '%{http_code}' \
+              https://omni.t3.group/v1/chat/completions \
+              -H "Authorization: Bearer $LIVE_API_KEY" \
+              -H 'Content-Type: application/json' \
+              --data-binary '{"model":"oc/mimo-v2.5-free","messages":[{"role":"user","content":"Reply with exactly OK."}],"stream":true}' || true)"
+            echo "live_authenticated_status=$status"
+            head -c 1200 /tmp/live-chat.body | tr '\n' ' ' || true
+            echo
+            if [ "$status" != "200" ]; then
+              echo "::error::authenticated OpenCode request through omni.t3.group failed"
+              exit 1
+            fi
+          else
+            echo "live_authenticated_status=SKIPPED_NO_REPO_SECRET"
+          fi
