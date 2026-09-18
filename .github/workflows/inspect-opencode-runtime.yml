@@ -405,6 +405,7 @@ jobs:
 
       - name: Patch and restart Coolify OmniRoute service
         env:
+          COOLIFY_URL: ${{ secrets.COOLIFY_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
           SERVICE_UUID: ${{ vars.COOLIFY_SERVICE_UUID }}
           APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
@@ -412,14 +413,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          COOLIFY_URL="https://t3ai.xyz"
-          for v in COOLIFY_API_TOKEN SERVICE_UUID APP_UUID DIGEST; do
+          for v in COOLIFY_URL COOLIFY_API_TOKEN SERVICE_UUID APP_UUID DIGEST; do
             if [ -z "${!v:-}" ]; then
               echo "::error::Missing required deployment value: $v"
               exit 1
             fi
           done
           IMAGE_REF="ghcr.io/shermzy/omniroute@$DIGEST"
+
+          auth_status="$(curl -sS \
+            -o /tmp/coolify-auth.json -w '%{http_code}' \
+            -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+            -H 'Accept: application/json' \
+            "$COOLIFY_URL/api/v1/services" || true)"
+          echo "coolify_auth_status=$auth_status"
+          if [ "$auth_status" != "200" ]; then
+            message="$(jq -r '.message // "Coolify authentication probe failed"' /tmp/coolify-auth.json 2>/dev/null || echo "Coolify authentication probe failed")"
+            echo "::error::$message"
+            exit 1
+          fi
 
           current="$(curl -fsS \
             -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
