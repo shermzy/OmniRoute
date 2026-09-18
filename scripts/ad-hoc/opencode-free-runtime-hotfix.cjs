@@ -27,13 +27,13 @@ const headerContract =
   'd&&!v(d,this.provider)&&"https://opencode.ai/zen/v1"===this.config?.baseUrl&&(' +
   'j.Authorization="Bearer public",' +
   'j.Accept="text/event-stream",' +
-  'j["User-Agent"]="opencode/1.18.31",' +
-  'j["x-opencode-client"]||="desktop",' +
-  'j["x-opencode-project"]||="global",' +
+  'j["User-Agent"]="opencode/beta/1.18.31/cli",' +
+  'j["x-opencode-client"]="cli",' +
+  'j["x-opencode-project"]="global",' +
   'j["x-opencode-session"]=/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(j["x-opencode-session"]||"")?' +
-  'j["x-opencode-session"]:"ses_"+(0,e.createHash)("sha256").update(String(j["x-opencode-session"]||d||"opencode")).digest("hex").slice(0,26),' +
+  'j["x-opencode-session"]:(()=>{let a=BigInt(Date.now())*4096n+1n,b=(~a)&281474976710655n,c=b.toString(16).padStart(12,"0"),d=(0,e.randomBytes)(14),f="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";return"ses_"+c+Array.from(d,a=>f[a%62]).join("")})(),' +
   'j["x-opencode-request"]=/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(j["x-opencode-request"]||"")?' +
-  'j["x-opencode-request"]:"msg_"+(0,e.createHash)("sha256").update(String(j["x-opencode-request"]||(0,e.randomUUID)())).digest("hex").slice(0,26)' +
+  'j["x-opencode-request"]:(()=>{let a=(BigInt(Date.now())*4096n+1n)&281474976710655n,b=a.toString(16).padStart(12,"0"),c=(0,e.randomBytes)(14),d="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";return"msg_"+b+Array.from(c,a=>d[a%62]).join("")})()' +
   ');return"openai-responses"===this._requestFormat&&d.startsWith("muse-spark")&&v(d,this.provider)&&';
 
 replaceOnce("header contract", returnNeedle, headerContract);
@@ -47,21 +47,22 @@ const transformReplacement =
   '!v(a,this.provider)&&"https://opencode.ai/zen/v1"===this.config?.baseUrl&&e&&"object"==typeof e&&!Array.isArray(e)&&(' +
   'e.stream=!0,' +
   'Array.isArray(e.tools)&&e.tools.length||(e.tools="openai-responses"===this._requestFormat?' +
-  '[{type:"function",name:"_noop",description:"Compatibility placeholder. Do not call.",parameters:{type:"object",properties:{}}}]:' +
-  '[{type:"function",function:{name:"_noop",description:"Compatibility placeholder. Do not call.",parameters:{type:"object",properties:{}}}}])' +
+  '[{type:"function",name:"_noop",description:"Do not call this tool. It exists only for API compatibility.",parameters:{type:"object",properties:{}}}]:' +
+  '[{type:"function",function:{name:"_noop",description:"Do not call this tool. It exists only for API compatibility.",parameters:{type:"object",properties:{}}}}])' +
   ');' +
   'if(e&&"object"==typeof e&&!Array.isArray(e)&&Object.prototype.hasOwnProperty.call(e,"client_metadata")&&delete e.client_metadata,e&&"object"==typeof e&&!Array.isArray(e)){';
 
 replaceOnce("body contract", transformNeedle, transformReplacement);
 
-if (!body.includes('Authorization="Bearer public"')) {
-  throw new Error("patched chunk is missing public bearer marker");
-}
-if (!body.includes('e.stream=!0')) {
-  throw new Error("patched chunk is missing forced streaming marker");
-}
-if (!body.includes('User-Agent"]="opencode/1.18.31"')) {
-  throw new Error("patched chunk is missing versioned OpenCode user-agent marker");
+for (const marker of [
+  'Authorization="Bearer public"',
+  'User-Agent"]="opencode/beta/1.18.31/cli"',
+  'x-opencode-client"]="cli"',
+  'e.stream=!0',
+  'msg_',
+  'ses_',
+]) {
+  if (!body.includes(marker)) throw new Error(`patched chunk is missing marker: ${marker}`);
 }
 
 fs.writeFileSync(file, body);
