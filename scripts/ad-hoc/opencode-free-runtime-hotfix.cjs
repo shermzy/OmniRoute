@@ -27,7 +27,7 @@ const headerContract =
   'd&&!v(d,this.provider)&&"https://opencode.ai/zen/v1"===this.config?.baseUrl&&(' +
   'j.Authorization="Bearer public",' +
   'j.Accept="text/event-stream",' +
-  'j["User-Agent"]="opencode/1.18.31",' +
+  'j["User-Agent"]="opencode/prod/1.18.31/cli",' +
   'j["x-opencode-client"]="cli",' +
   'j["x-opencode-project"]="global",' +
   'j["x-opencode-session"]=/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(j["x-opencode-session"]||"")?' +
@@ -56,7 +56,7 @@ replaceOnce("body contract", transformNeedle, transformReplacement);
 
 for (const marker of [
   'Authorization="Bearer public"',
-  'User-Agent"]="opencode/1.18.31"',
+  'User-Agent"]="opencode/prod/1.18.31/cli"',
   'x-opencode-client"]="cli"',
   'e.stream=!0',
   'msg_',
