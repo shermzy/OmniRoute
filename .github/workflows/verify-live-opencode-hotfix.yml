@@ -1,0 +1,91 @@
+name: Verify live OpenCode hotfix
+
+on:
+  push:
+    branches:
+      - verify/opencode-free-live-20260918
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify health, OpenCode request, catalog, and management access
+        env:
+          LIVE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${LIVE_API_KEY:-}" ]; then
+            echo "::error::OMNIROUTE_API_KEY is not configured"
+            exit 1
+          fi
+
+          health_status="$(curl -sS --max-time 10 -o /tmp/health.json -w '%{http_code}' https://omni.t3.group/healthz || true)"
+          echo "health_status=$health_status"
+          head -c 500 /tmp/health.json 2>/dev/null || true
+          echo
+          if [ "$health_status" != "200" ]; then
+            echo "::error::omni.t3.group health check failed"
+            exit 1
+          fi
+
+          chat_status="$(curl -sS -N --max-time 120             -o /tmp/chat.body -w '%{http_code}'             https://omni.t3.group/v1/chat/completions             -H "Authorization: Bearer $LIVE_API_KEY"             -H 'Content-Type: application/json'             --data-binary '{"model":"oc/mimo-v2.5-free","messages":[{"role":"user","content":"Reply with exactly OK."}],"stream":true}' || true)"
+          echo "opencode_chat_status=$chat_status"
+          head -c 1600 /tmp/chat.body | tr '\n' ' ' || true
+          echo
+          if [ "$chat_status" != "200" ]; then
+            echo "::error::live OpenCode free request failed"
+            exit 1
+          fi
+
+          models_status="$(curl -sS --max-time 30 -o /tmp/models.json -w '%{http_code}'             https://omni.t3.group/v1/models             -H "Authorization: Bearer $LIVE_API_KEY"             -H 'Accept: application/json' || true)"
+          echo "models_status=$models_status"
+          if [ "$models_status" = "200" ]; then
+            python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/models.json'))
+          items=data.get('data', data if isinstance(data,list) else [])
+          ids=sorted(
+              str(x.get('id',''))
+              for x in items
+              if isinstance(x,dict) and str(x.get('id','')).startswith('oc/')
+          )
+          print('visible_oc_models=' + json.dumps(ids))
+          PY
+          fi
+
+          manage_status="$(curl -sS --max-time 30 -o /tmp/providers.json -w '%{http_code}'             https://omni.t3.group/api/providers             -H "Authorization: Bearer $LIVE_API_KEY"             -H 'Accept: application/json' || true)"
+          echo "management_status=$manage_status"
+          if [ "$manage_status" = "200" ]; then
+            python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/providers.json'))
+          rows=[]
+          for c in data.get('connections', []):
+              if not isinstance(c,dict):
+                  continue
+              psd=c.get('providerSpecificData') if isinstance(c.get('providerSpecificData'),dict) else {}
+              rows.append({
+                  'id': c.get('id'),
+                  'provider': c.get('provider'),
+                  'name': c.get('name') or c.get('displayName'),
+                  'defaultModel': c.get('defaultModel'),
+                  'testStatus': c.get('testStatus'),
+                  'importFreeOnly': psd.get('importFreeOnly'),
+                  'autoFetchModels': psd.get('autoFetchModels'),
+              })
+          print('sanitized_providers=' + json.dumps(rows, sort_keys=True))
+          PY
+          else
+            python3 - <<'PY'
+          import json
+          try:
+              data=json.load(open('/tmp/providers.json'))
+          except Exception:
+              data={}
+          print('management_message=' + str(data.get('error') or data.get('message') or 'unavailable')[:300])
+          PY
+          fi
