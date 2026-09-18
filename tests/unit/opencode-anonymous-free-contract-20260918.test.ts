@@ -1,3 +1,4 @@
+// Live acceptance of this contract is performed by the hotfix workflow against omni.t3.group.
 import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import {
