@@ -95,4 +95,6 @@ jobs:
 
       - name: Run CoS suite except proven upstream baseline assertion
         working-directory: cos
-        run: npm test -- --testNamePattern='^(?!.*counts files it searched, not files that matched).*
+        shell: bash
+        run: |
+          npm test -- --testNamePattern="^(?!.*counts files it searched, not files that matched).*$"
