@@ -9,6 +9,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: opencode-free-hotfix
+  cancel-in-progress: true
+
 env:
   BASE_IMAGE: ghcr.io/diegosouzapw/omniroute@sha256:80eade3c516c4b4e0b9ab07a72a96648155722fbf311cfb4bc058cc4d1e18b3a
   IMAGE_TAG: ghcr.io/shermzy/omniroute:opencode-hotfix-20260918
@@ -19,6 +23,31 @@ jobs:
     steps:
       - name: Checkout hotfix branch
         uses: actions/checkout@v4
+
+      - name: Set up Node.js for source regression tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install OmniRoute dependencies
+        run: npm ci
+
+      - name: Verify source-level OpenCode anonymous free contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DISABLE_SQLITE_AUTO_BACKUP=true
+          node --import tsx/esm \
+            --import ./open-sse/utils/setupPolyfill.ts \
+            --import ./tests/_setup/isolateDataDir.ts \
+            --test --test-force-exit \
+            tests/unit/opencode-anonymous-free-contract-20260918.test.ts \
+            tests/unit/opencode-cli-headers-synthesis-5997.test.ts \
+            tests/unit/opencode-session-fingerprint-headers-10571.test.ts \
+            tests/unit/opencode-executor.test.ts \
+            tests/unit/opencode-premium-keyless-gate-8681.test.ts
+          npm run check:open-sse-typecheck
 
       - name: Prove and inspect free tier with the official OpenCode binary
         shell: bash
