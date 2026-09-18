@@ -533,7 +533,7 @@ jobs:
             echo "ssh_fallback_probe=ready target=$target"
 
       - name: Verify public service and optional authenticated OpenCode call
-        if: steps.coolify.outputs.deployed == 'true'
+        if: always()
         env:
           LIVE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
         shell: bash
