@@ -31,13 +31,13 @@ jobs:
           mkdir -p /tmp/opencode-probe
           cd /tmp/opencode-probe
 
-          npx -y opencode@1.18.31 --version
+          npx -y opencode-ai@1.18.31 --version
 
           success=0
           for model in opencode/mimo-v2.5-free opencode/big-pickle opencode/nemotron-3-ultra-free; do
             rm -f /tmp/opencode-run.out
             set +e
-            timeout 120 npx -y opencode@1.18.31 run \
+            timeout 120 npx -y opencode-ai@1.18.31 run \
               --model "$model" \
               --format json \
               "Reply with exactly OK." \
