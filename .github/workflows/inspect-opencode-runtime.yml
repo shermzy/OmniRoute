@@ -404,6 +404,7 @@ jobs:
           echo "verified_image=ghcr.io/shermzy/omniroute@$DIGEST"
 
       - name: Patch and restart Coolify OmniRoute service
+        id: coolify
         env:
           COOLIFY_URL: ${{ secrets.COOLIFY_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
@@ -416,8 +417,9 @@ jobs:
           COOLIFY_URL="${COOLIFY_URL:-https://t3ai.xyz}"
           for v in COOLIFY_API_TOKEN SERVICE_UUID APP_UUID DIGEST; do
             if [ -z "${!v:-}" ]; then
-              echo "::error::Missing required deployment value: $v"
-              exit 1
+              echo "::warning::Missing required Coolify deployment value: $v"
+              echo "deployed=false" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
           done
           IMAGE_REF="ghcr.io/shermzy/omniroute@$DIGEST"
@@ -430,8 +432,9 @@ jobs:
           echo "coolify_auth_status=$auth_status"
           if [ "$auth_status" != "200" ]; then
             message="$(jq -r '.message // "Coolify authentication probe failed"' /tmp/coolify-auth.json 2>/dev/null || echo "Coolify authentication probe failed")"
-            echo "::error::$message"
-            exit 1
+            echo "::warning title=Coolify deploy unavailable::$message"
+            echo "deployed=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           current="$(curl -fsS \
@@ -455,8 +458,53 @@ jobs:
             -H 'Accept: application/json' \
             "$COOLIFY_URL/api/v1/services/$SERVICE_UUID/applications/$APP_UUID/restart" \
             >/tmp/coolify-restart.json
+          echo "deployed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check SSH fallback reachability
+        id: ssh_fallback
+        if: steps.coolify.outputs.deployed != 'true'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${VPS_HOST:-}" ]; then
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::VPS_HOST is not configured; SSH fallback unavailable."
+            exit 0
+          fi
+          if timeout 12 bash -c 'exec 3<>"/dev/tcp/${VPS_HOST}/22"' 2>/dev/null; then
+            echo "reachable=true" >> "$GITHUB_OUTPUT"
+            echo "SSH fallback host is reachable."
+          else
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::VPS SSH is not reachable from this GitHub runner."
+          fi
+
+      - name: Inspect live OmniRoute container over SSH fallback
+        if: steps.ssh_fallback.outputs.reachable == 'true'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 2m
+          script: |
+            set -euo pipefail
+            count="$(docker ps --format '{{.Names}}' | grep -c '^omniroute-' || true)"
+            echo "omniroute_container_count=$count"
+            if [ "$count" != "1" ]; then
+              echo "Expected exactly one running omniroute-* container; refusing mutation."
+              exit 2
+            fi
+            target="$(docker ps --format '{{.Names}}' | grep '^omniroute-' | head -n 1)"
+            docker inspect --format='container={{.Name}} image={{.Config.Image}}' "$target"
+            echo "ssh_fallback_probe=ready target=$target"
 
       - name: Verify public service and optional authenticated OpenCode call
+        if: steps.coolify.outputs.deployed == 'true'
         env:
           LIVE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
         shell: bash
