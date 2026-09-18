@@ -7,61 +7,75 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
-  inspect:
+  probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull current mirrored upstream channel
-        run: docker pull ghcr.io/diegosouzapw/omniroute:next
-
-      - name: Inspect exact OpenCode source and compiled chunk
+      - name: Probe current OpenCode free-tier contract
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -i --entrypoint node ghcr.io/diegosouzapw/omniroute:next --input-type=module - <<'NODE'
-          import fs from "node:fs";
-          import crypto from "node:crypto";
+          python3 - <<'PY'
+          import json, subprocess, tempfile, os
 
-          const files = [
-            "/app/open-sse/executors/opencode.ts",
-            "/app/.build/next/server/chunks/45782.js",
-          ];
-          const needles = [
-            "OPENCODE_SYNTHESIZE_CLI_HEADERS",
-            "x-opencode-session",
-            "opencode.ai/zen/v1",
-            "muse-spark",
-            "forwardOpencodeClientHeaders",
-            "transformRequest(",
-          ];
+          models = [
+            "mimo-v2.5-free",
+            "big-pickle",
+            "deepseek-v4-flash-free",
+            "hy3-free",
+            "nemotron-3-ultra-free",
+            "north-mini-code-free",
+          ]
+          tools = ["_noop", "read", "bash", "grep", "glob", "write", "edit"]
+          url = "https://opencode.ai/zen/v1/chat/completions"
+          headers = [
+            "Content-Type: application/json",
+            "Accept: text/event-stream",
+            "User-Agent: opencode/1.18.31",
+            "x-opencode-client: desktop",
+            "x-opencode-project: global",
+            "x-opencode-session: ses_abcdef123456abcdefghijklmn",
+            "x-opencode-request: msg_abcdef123456abcdefghijklmn",
+          ]
 
-          for (const file of files) {
-            const body = fs.readFileSync(file, "utf8");
-            console.log("\n=== FILE ===", file);
-            console.log("SHA256", crypto.createHash("sha256").update(body).digest("hex"));
-            console.log("SIZE", body.length);
-            for (const needle of needles) {
-              let from = 0;
-              let count = 0;
-              while (count < 3) {
-                const i = body.indexOf(needle, from);
-                if (i < 0) break;
-                count++;
-                const start = Math.max(0, i - 1400);
-                const end = Math.min(body.length, i + needle.length + 4200);
-                console.log("\n--- NEEDLE", JSON.stringify(needle), "MATCH", count, "AT", i, "---");
-                console.log(body.slice(start, end).replace(/[\r\n]+/g, " "));
-                from = i + needle.length;
+          for model in models:
+            print(f"=== MODEL {model} ===")
+            success = False
+            for tool in tools:
+              payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+                "stream": True,
+                "tools": [{
+                  "type": "function",
+                  "function": {
+                    "name": tool,
+                    "description": "Compatibility placeholder. Do not call.",
+                    "parameters": {"type": "object", "properties": {}},
+                  },
+                }],
               }
-            }
-          }
-          NODE
+              fd, path = tempfile.mkstemp()
+              os.close(fd)
+              cmd = ["curl","-sS","--max-time","35","-o",path,"-w","%{http_code}",url]
+              for h in headers:
+                cmd += ["-H", h]
+              cmd += ["--data-binary", json.dumps(payload)]
+              try:
+                p = subprocess.run(cmd, text=True, capture_output=True, timeout=40)
+                status = p.stdout.strip()[-3:] if p.stdout.strip() else "000"
+                body = open(path, "r", encoding="utf-8", errors="replace").read(900)
+              except Exception as e:
+                status = "ERR"
+                body = str(e)
+              finally:
+                try: os.unlink(path)
+                except OSError: pass
+              summary = " ".join(body.split())[:500]
+              print(f"tool={tool} status={status} body={summary}")
+              if status == "200":
+                success = True
+                break
+            print(f"RESULT model={model} success={str(success).lower()}")
+          PY
