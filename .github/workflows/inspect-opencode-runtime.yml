@@ -23,52 +23,19 @@ jobs:
       - name: Pull current mirrored upstream channel
         run: docker pull ghcr.io/diegosouzapw/omniroute:next
 
-      - name: Locate compiled OpenCode runtime code
+      - name: Inspect standalone layout and OpenCode strings
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -i --entrypoint node ghcr.io/diegosouzapw/omniroute:next --input-type=module - <<'NODE'
-          import fs from "node:fs";
-          import path from "node:path";
-
-          const needles = [
-            "OPENCODE_SYNTHESIZE_CLI_HEADERS",
-            "x-opencode-session",
-            "muse-spark",
-            "FreeUsageLimitError",
-            "opencode.ai/zen/v1",
-          ];
-
-          const roots = ["/app/.next", "/app/dev", "/app/server.js"];
-          const seen = new Set();
-
-          function visit(p) {
-            if (!fs.existsSync(p)) return;
-            const stat = fs.statSync(p);
-            if (stat.isDirectory()) {
-              for (const name of fs.readdirSync(p)) {
-                if (name === "node_modules" || name === "data") continue;
-                visit(path.join(p, name));
-              }
-              return;
-            }
-            if (!/\.(?:js|mjs|cjs)$/.test(p) || stat.size > 12_000_000) return;
-            let body;
-            try { body = fs.readFileSync(p, "utf8"); } catch { return; }
-            const hits = needles.filter((n) => body.includes(n));
-            if (!hits.length || seen.has(p)) return;
-            seen.add(p);
-            console.log("\nFILE", p, "SIZE", stat.size, "HITS", hits.join(","));
-            for (const needle of hits) {
-              const i = body.indexOf(needle);
-              const start = Math.max(0, i - 500);
-              const end = Math.min(body.length, i + needle.length + 1200);
-              console.log("NEEDLE", needle);
-              console.log(body.slice(start, end).replace(/[\r\n]+/g, " "));
-            }
-          }
-
-          for (const root of roots) visit(root);
-          console.log("\nMATCHED_FILES", seen.size);
-          if (!seen.size) process.exitCode = 2;
-          NODE
+          docker run --rm --entrypoint sh ghcr.io/diegosouzapw/omniroute:next -lc '
+            echo "=== TOP ==="
+            find /app -maxdepth 3 -type f | sort | head -n 300
+            echo "=== OPENCODE_FILENAMES ==="
+            find /app -type f -iname "*opencode*" | sort | head -n 200
+            echo "=== SESSION_STRING_MATCHES ==="
+            grep -R -l --binary-files=without-match "x-opencode-session" /app 2>/dev/null | head -n 100 || true
+            echo "=== SYNTHESIS_STRING_MATCHES ==="
+            grep -R -l --binary-files=without-match "OPENCODE_SYNTHESIZE_CLI_HEADERS" /app 2>/dev/null | head -n 100 || true
+            echo "=== ZEN_URL_MATCHES ==="
+            grep -R -l --binary-files=without-match "opencode.ai/zen/v1" /app 2>/dev/null | head -n 100 || true
+          '
