@@ -28,55 +28,106 @@ jobs:
           import json, os, secrets, subprocess, tempfile, time
 
           chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-          def identifier(prefix):
-              current = int(time.time() * 1000) * 0x1000 + 1
-              value = (~current) & ((1 << 48) - 1)
+          last_ms = None
+          counter = 0
+
+          def identifier(prefix, descending):
+              global last_ms, counter
+              now = int(time.time() * 1000)
+              if now != last_ms:
+                  last_ms = now
+                  counter = 0
+              counter += 1
+              current = now * 0x1000 + counter
+              value = (~current if descending else current) & ((1 << 48) - 1)
               head = value.to_bytes(6, "big").hex()
               tail = "".join(chars[b % 62] for b in secrets.token_bytes(14))
               return prefix + head + tail
 
-          payload = {
-              "model": "mimo-v2.5-free",
-              "messages": [{"role": "user", "content": "Reply with exactly OK."}],
-              "stream": True,
-              "tools": [{
-                  "type": "function",
-                  "function": {
-                      "name": "_noop",
-                      "description": "Compatibility placeholder. Do not call.",
-                      "parameters": {"type": "object", "properties": {}},
-                  },
-              }],
-          }
-          headers = [
-              "Content-Type: application/json",
-              "Accept: text/event-stream",
-              "Authorization: Bearer public",
-              "User-Agent: opencode/1.18.31",
-              "x-opencode-client: desktop",
-              "x-opencode-project: global",
-              "x-opencode-session: " + identifier("ses_"),
-              "x-opencode-request: " + identifier("msg_"),
+          models = ["mimo-v2.5-free", "big-pickle", "nemotron-3-ultra-free"]
+          variants = [
+              ("beta-cli-global", "opencode/beta/1.18.31/cli", "cli", "global"),
+              ("latest-cli-global", "opencode/latest/1.18.31/cli", "cli", "global"),
+              ("simple-cli-global", "opencode/1.18.31", "cli", "global"),
+              ("beta-cli-no-project", "opencode/beta/1.18.31/cli", "cli", None),
           ]
+          tool_names = ["read", "write", "edit", "bash", "grep", "glob", "_noop"]
+          url = "https://opencode.ai/zen/v1/chat/completions"
 
-          fd, path = tempfile.mkstemp()
-          os.close(fd)
-          cmd = [
-              "curl", "-sS", "--max-time", "45",
-              "-o", path, "-w", "%{http_code}",
-              "https://opencode.ai/zen/v1/chat/completions",
-          ]
-          for h in headers:
-              cmd += ["-H", h]
-          cmd += ["--data-binary", json.dumps(payload)]
-          p = subprocess.run(cmd, text=True, capture_output=True, timeout=50)
-          status = p.stdout.strip()[-3:] if p.stdout.strip() else "000"
-          body = open(path, "r", encoding="utf-8", errors="replace").read(1600)
-          os.unlink(path)
-          print("direct_upstream_status=" + status)
-          print("direct_upstream_preview=" + " ".join(body.split())[:1000])
-          if status != "200":
+          working = None
+          for model in models:
+              if working:
+                  break
+              for variant, ua, client, project in variants:
+                  if working:
+                      break
+                  session_id = identifier("ses_", True)
+                  for tool_name in tool_names:
+                      payload = {
+                          "model": model,
+                          "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+                          "stream": True,
+                          "tools": [{
+                              "type": "function",
+                              "function": {
+                                  "name": tool_name,
+                                  "description": "Compatibility probe. Do not call.",
+                                  "parameters": {"type": "object", "properties": {}},
+                              },
+                          }],
+                      }
+                      headers = [
+                          "Content-Type: application/json",
+                          "Accept: text/event-stream",
+                          "Authorization: Bearer public",
+                          "User-Agent: " + ua,
+                          "x-opencode-client: " + client,
+                          "x-opencode-session: " + session_id,
+                          "x-opencode-request: " + identifier("msg_", False),
+                      ]
+                      if project:
+                          headers.append("x-opencode-project: " + project)
+
+                      fd, path = tempfile.mkstemp()
+                      os.close(fd)
+                      cmd = [
+                          "curl", "-sS", "--max-time", "35",
+                          "-o", path, "-w", "%{http_code}", url,
+                      ]
+                      for header in headers:
+                          cmd += ["-H", header]
+                      cmd += ["--data-binary", json.dumps(payload)]
+                      try:
+                          proc = subprocess.run(cmd, text=True, capture_output=True, timeout=40)
+                          status = proc.stdout.strip()[-3:] if proc.stdout.strip() else "000"
+                          body = open(path, "r", encoding="utf-8", errors="replace").read(900)
+                      except Exception as exc:
+                          status = "ERR"
+                          body = str(exc)
+                      finally:
+                          try:
+                              os.unlink(path)
+                          except OSError:
+                              pass
+
+                      preview = " ".join(body.split())[:450]
+                      print(f"probe model={model} variant={variant} tool={tool_name} status={status} body={preview}")
+                      if status == "200":
+                          working = (model, variant, ua, client, project or "", tool_name)
+                          break
+
+          if not working:
               raise SystemExit("OpenCode direct contract probe failed; refusing to build/deploy")
+
+          model, variant, ua, client, project, tool_name = working
+          print(
+              "direct_upstream_working="
+              f"model={model} variant={variant} ua={ua} client={client} project={project or '<omitted>'} tool={tool_name}"
+          )
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"OPENCODE_PROBE_MODEL={model}\n")
+              env.write(f"OPENCODE_PROBE_TOOL={tool_name}\n")
+              env.write(f"OPENCODE_PROBE_VARIANT={variant}\n")
           PY
 
       - name: Log in to GHCR
