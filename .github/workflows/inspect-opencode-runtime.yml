@@ -66,6 +66,121 @@ jobs:
 
           npx -y opencode-ai@1.18.31 --version
 
+          # Capture the exact wire request emitted by the known-good official CLI.
+          # This uses OpenCode's documented provider.options.baseURL override and a
+          # local OpenAI-compatible SSE stub; no external credential is involved.
+          rm -rf /tmp/opencode-capture
+          mkdir -p /tmp/opencode-capture
+          cat > /tmp/opencode-capture/opencode.json <<'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "opencode": {
+                "options": {
+                  "baseURL": "http://127.0.0.1:18765/v1"
+                }
+              }
+            }
+          }
+          JSON
+          cat > /tmp/opencode-capture-server.cjs <<'NODE'
+          const http = require("node:http");
+          const fs = require("node:fs");
+          const server = http.createServer((req, res) => {
+            const chunks = [];
+            req.on("data", (chunk) => chunks.push(chunk));
+            req.on("end", () => {
+              const body = Buffer.concat(chunks).toString("utf8");
+              const headers = { ...req.headers };
+              if (headers.authorization && headers.authorization !== "Bearer public") {
+                headers.authorization = "<redacted>";
+              }
+              fs.writeFileSync(
+                "/tmp/opencode-wire-capture.json",
+                JSON.stringify({ method: req.method, url: req.url, headers, body }, null, 2)
+              );
+              res.writeHead(200, {
+                "content-type": "text/event-stream",
+                "cache-control": "no-cache",
+                connection: "keep-alive"
+              });
+              res.write(
+                'data: {"id":"chatcmpl-capture","object":"chat.completion.chunk","created":1,"model":"mimo-v2.5-free","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":null}]}\n\n'
+              );
+              res.write(
+                'data: {"id":"chatcmpl-capture","object":"chat.completion.chunk","created":1,"model":"mimo-v2.5-free","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+              );
+              res.end("data: [DONE]\n\n");
+            });
+          });
+          server.listen(18765, "127.0.0.1");
+          NODE
+          node /tmp/opencode-capture-server.cjs >/tmp/opencode-capture-server.log 2>&1 &
+          CAPTURE_PID=$!
+          sleep 1
+          set +e
+          (
+            cd /tmp/opencode-capture
+            timeout 45 npx -y opencode-ai@1.18.31 run \
+              --model opencode/mimo-v2.5-free \
+              --format json \
+              "Reply with exactly OK." \
+              >/tmp/opencode-capture-run.out 2>&1
+          )
+          CAPTURE_RC=$?
+          set -e
+          kill "$CAPTURE_PID" >/dev/null 2>&1 || true
+          echo "official_cli_capture_rc=$CAPTURE_RC"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("/tmp/opencode-wire-capture.json")
+          if not p.exists():
+              print("WIRE_CAPTURE_MISSING")
+          else:
+              cap = json.loads(p.read_text())
+              print("WIRE_CAPTURE_METHOD=" + str(cap.get("method")))
+              print("WIRE_CAPTURE_URL=" + str(cap.get("url")))
+              print("WIRE_CAPTURE_HEADERS=" + json.dumps(cap.get("headers", {}), sort_keys=True))
+              try:
+                  body = json.loads(cap.get("body") or "{}")
+              except Exception as exc:
+                  print("WIRE_CAPTURE_BODY_PARSE_ERROR=" + str(exc))
+                  body = {}
+              summary = {
+                  "keys": sorted(body.keys()),
+                  "model": body.get("model"),
+                  "stream": body.get("stream"),
+                  "temperature": body.get("temperature"),
+                  "top_p": body.get("top_p"),
+                  "max_tokens": body.get("max_tokens"),
+                  "max_completion_tokens": body.get("max_completion_tokens"),
+                  "messages_count": len(body.get("messages") or []),
+                  "tools_count": len(body.get("tools") or []),
+                  "tool_names": [
+                      (tool.get("function") or {}).get("name")
+                      for tool in (body.get("tools") or [])
+                      if isinstance(tool, dict)
+                  ],
+              }
+              print("WIRE_CAPTURE_BODY_SUMMARY=" + json.dumps(summary, sort_keys=True))
+              for idx, message in enumerate(body.get("messages") or []):
+                  if not isinstance(message, dict):
+                      continue
+                  content = message.get("content")
+                  rendered = json.dumps(content, ensure_ascii=False) if not isinstance(content, str) else content
+                  print(
+                      f"WIRE_CAPTURE_MESSAGE_{idx}="
+                      + json.dumps({
+                          "role": message.get("role"),
+                          "content_len": len(rendered),
+                          "content_prefix": rendered[:4000],
+                      }, ensure_ascii=False)
+                  )
+              print("WIRE_CAPTURE_BODY=" + json.dumps(body, ensure_ascii=False, separators=(",", ":")))
+          PY
+
           success=0
           for model in opencode/mimo-v2.5-free opencode/big-pickle opencode/nemotron-3-ultra-free; do
             rm -f /tmp/opencode-run.out
