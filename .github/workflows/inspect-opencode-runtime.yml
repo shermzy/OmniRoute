@@ -22,14 +22,11 @@ jobs:
           models = [
             "mimo-v2.5-free",
             "big-pickle",
-            "deepseek-v4-flash-free",
-            "hy3-free",
             "nemotron-3-ultra-free",
-            "north-mini-code-free",
           ]
           tools = ["_noop", "read", "bash", "grep", "glob", "write", "edit"]
           url = "https://opencode.ai/zen/v1/chat/completions"
-          headers = [
+          base_headers = [
             "Content-Type: application/json",
             "Accept: text/event-stream",
             "User-Agent: opencode/1.18.31",
@@ -37,6 +34,7 @@ jobs:
             "x-opencode-project: global",
             "x-opencode-session: ses_abcdef123456abcdefghijklmn",
             "x-opencode-request: msg_abcdef123456abcdefghijklmn",
+            "Authorization: Bearer public",
           ]
 
           for model in models:
@@ -59,20 +57,20 @@ jobs:
               fd, path = tempfile.mkstemp()
               os.close(fd)
               cmd = ["curl","-sS","--max-time","35","-o",path,"-w","%{http_code}",url]
-              for h in headers:
+              for h in base_headers:
                 cmd += ["-H", h]
               cmd += ["--data-binary", json.dumps(payload)]
               try:
                 p = subprocess.run(cmd, text=True, capture_output=True, timeout=40)
                 status = p.stdout.strip()[-3:] if p.stdout.strip() else "000"
-                body = open(path, "r", encoding="utf-8", errors="replace").read(900)
+                body = open(path, "r", encoding="utf-8", errors="replace").read(1200)
               except Exception as e:
                 status = "ERR"
                 body = str(e)
               finally:
                 try: os.unlink(path)
                 except OSError: pass
-              summary = " ".join(body.split())[:500]
+              summary = " ".join(body.split())[:700]
               print(f"tool={tool} status={status} body={summary}")
               if status == "200":
                 success = True
