@@ -20,16 +20,42 @@ jobs:
       - name: Checkout hotfix branch
         uses: actions/checkout@v4
 
-      - name: Prove free tier with the official OpenCode binary
+      - name: Prove and inspect free tier with the official OpenCode binary
         shell: bash
         env:
           OPENCODE_DISABLE_AUTOUPDATE: "true"
-          OPENCODE_DISABLE_PROJECT_CONFIG: "true"
-          OPENCODE_PURE: "true"
         run: |
           set -euo pipefail
-          mkdir -p /tmp/opencode-probe
+          mkdir -p /tmp/opencode-probe/.opencode/plugins
           cd /tmp/opencode-probe
+
+          cat > .opencode/plugins/wire-probe.js <<'PLUGIN'
+          export const WireProbe = async () => ({
+            "chat.params": async (input, output) => {
+              if (input?.model?.providerID !== "opencode") return
+              console.error("WIRE_PARAMS=" + JSON.stringify({
+                sessionID: input.sessionID,
+                model: input.model?.id ?? input.model?.modelID,
+                temperature: output.temperature,
+                topP: output.topP,
+                topK: output.topK,
+                maxOutputTokens: output.maxOutputTokens,
+                options: output.options,
+              }))
+            },
+            "chat.headers": async (input, output) => {
+              if (input?.model?.providerID !== "opencode") return
+              const headers = { ...output.headers }
+              for (const key of Object.keys(headers)) {
+                if (/authorization|api[-_]?key|token|cookie/i.test(key)) headers[key] = "<redacted>"
+              }
+              console.error("WIRE_PLUGIN_HEADERS=" + JSON.stringify(headers))
+            },
+            "tool.definition": async (input) => {
+              console.error("WIRE_TOOL=" + input.toolID)
+            },
+          })
+          PLUGIN
 
           npx -y opencode-ai@1.18.31 --version
 
@@ -45,6 +71,7 @@ jobs:
             rc=$?
             set -e
             echo "official_cli_model=$model rc=$rc"
+            grep -E '^(WIRE_PARAMS=|WIRE_PLUGIN_HEADERS=|WIRE_TOOL=)' /tmp/opencode-run.out || true
             tail -c 4000 /tmp/opencode-run.out || true
             echo
             if [ "$rc" = "0" ] && grep -qiE '"text"|OK|session' /tmp/opencode-run.out; then
