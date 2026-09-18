@@ -30,7 +30,13 @@ jobs:
           cd /tmp/opencode-probe
 
           cat > .opencode/plugins/wire-probe.js <<'PLUGIN'
-          export const WireProbe = async () => ({
+          export const WireProbe = async (ctx) => {
+            console.error("WIRE_PROJECT=" + JSON.stringify({
+              id: ctx?.project?.id,
+              directory: ctx?.directory,
+              worktree: ctx?.worktree,
+            }))
+            return ({
             "chat.params": async (input, output) => {
               if (input?.model?.providerID !== "opencode") return
               console.error("WIRE_PARAMS=" + JSON.stringify({
@@ -55,6 +61,7 @@ jobs:
               console.error("WIRE_TOOL=" + input.toolID)
             },
           })
+          }
           PLUGIN
 
           npx -y opencode-ai@1.18.31 --version
@@ -71,7 +78,7 @@ jobs:
             rc=$?
             set -e
             echo "official_cli_model=$model rc=$rc"
-            grep -E '^(WIRE_PARAMS=|WIRE_PLUGIN_HEADERS=|WIRE_TOOL=)' /tmp/opencode-run.out || true
+            grep -E '^(WIRE_PROJECT=|WIRE_PARAMS=|WIRE_PLUGIN_HEADERS=|WIRE_TOOL=)' /tmp/opencode-run.out || true
             tail -c 4000 /tmp/opencode-run.out || true
             echo
             if [ "$rc" = "0" ] && grep -qiE '"text"|OK|session' /tmp/opencode-run.out; then
@@ -85,6 +92,89 @@ jobs:
             echo "::error::Official OpenCode CLI itself cannot use the free tier from this runner"
             exit 1
           fi
+
+          PROJECT_ID="$(grep '^WIRE_PROJECT=' /tmp/opencode-run.out | head -n1 | sed 's/^WIRE_PROJECT=//' | jq -r '.id // empty')"
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::error::Could not capture the official CLI project id"
+            exit 1
+          fi
+          echo "official_cli_project_id=$PROJECT_ID"
+
+          python3 - "$PROJECT_ID" <<'PY'
+          import json, os, secrets, subprocess, sys, tempfile, time
+
+          project_id = sys.argv[1]
+          chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+          counter = 0
+          last_ms = None
+
+          def ident(prefix, descending):
+              global counter, last_ms
+              now = int(time.time() * 1000)
+              if now != last_ms:
+                  last_ms = now
+                  counter = 0
+              counter += 1
+              current = now * 0x1000 + counter
+              value = (~current if descending else current) & ((1 << 48) - 1)
+              head = value.to_bytes(6, "big").hex()
+              tail = "".join(chars[b % 62] for b in secrets.token_bytes(14))
+              return prefix + head + tail
+
+          tool_names = [
+              "bash", "edit", "glob", "grep", "invalid", "question", "read",
+              "skill", "task", "todowrite", "webfetch", "websearch", "write",
+          ]
+          tools = [
+              {
+                  "type": "function",
+                  "function": {
+                      "name": name,
+                      "description": "OpenCode compatibility tool.",
+                      "parameters": {"type": "object", "properties": {}},
+                  },
+              }
+              for name in tool_names
+          ]
+          payload = {
+              "model": "mimo-v2.5-free",
+              "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+              "stream": True,
+              "temperature": 0.5,
+              "max_tokens": 32000,
+              "tools": tools,
+          }
+          headers = [
+              "Content-Type: application/json",
+              "Accept: text/event-stream",
+              "Authorization: Bearer public",
+              "User-Agent: opencode/prod/1.18.31/cli",
+              "x-opencode-client: cli",
+              "x-opencode-project: " + project_id,
+              "x-opencode-session: " + ident("ses_", True),
+              "x-opencode-request: " + ident("msg_", False),
+          ]
+
+          fd, path = tempfile.mkstemp()
+          os.close(fd)
+          cmd = [
+              "curl", "-sS", "-N", "--max-time", "90",
+              "-o", path, "-w", "%{http_code}",
+              "https://opencode.ai/zen/v1/chat/completions",
+          ]
+          for h in headers:
+              cmd += ["-H", h]
+          cmd += ["--data-binary", json.dumps(payload)]
+
+          proc = subprocess.run(cmd, text=True, capture_output=True, timeout=100)
+          status = proc.stdout.strip()[-3:] if proc.stdout.strip() else "000"
+          body = open(path, "r", encoding="utf-8", errors="replace").read(2200)
+          os.unlink(path)
+          print("exact_replay_status=" + status)
+          print("exact_replay_preview=" + " ".join(body.split())[:1600])
+          if status != "200":
+              raise SystemExit("Exact working-CLI contract replay failed; refusing to build/deploy")
+          PY
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
