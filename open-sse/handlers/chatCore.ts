@@ -5035,6 +5035,13 @@ export async function handleChatCore({
       legResult = loopApply.leg;
     }
 
+    // The initial error leg already returned above, and an applied tool loop
+    // can only replace it with another ok leg. Reassert that invariant here
+    // so TypeScript keeps the discriminated union narrowed after assignment.
+    if (legResult.kind === "error") {
+      return legResult.result;
+    }
+
     if (legResult.upstreamResponse) {
       providerResponse = legResult.upstreamResponse;
       providerHeaders = normalizeHeaders(legResult.upstreamResponse.headers);
