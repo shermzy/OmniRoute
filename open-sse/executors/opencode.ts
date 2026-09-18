@@ -765,10 +765,6 @@ export class OpencodeExecutor extends BaseExecutor {
       headers["Accept"] = "text/event-stream";
     }
 
-    if (anonymousFreeZen) {
-      applyAnonymousFreeOpencodeHeaders(headers, clientHeaders ?? {});
-    }
-
     // Synthesize OpenCode CLI identity headers by default so Cloudflare in front of
     // opencode.ai/zen doesn't 429 VPS requests lacking CLI identity. Opt-out via
     // OPENCODE_SYNTHESIZE_CLI_HEADERS=false. Client-supplied headers always win;
@@ -810,6 +806,13 @@ export class OpencodeExecutor extends BaseExecutor {
             }
           : undefined,
       });
+    }
+
+    // Anonymous free Zen requires the exact CLI identity even when the caller
+    // supplied generic OpenAI client headers. Apply this last so curl/SDK
+    // User-Agent and non-canonical OpenCode metadata cannot overwrite it.
+    if (anonymousFreeZen) {
+      applyAnonymousFreeOpencodeHeaders(headers, clientHeaders ?? {});
     }
 
     // Muse's Responses endpoint rejects the short conversation fingerprint used
