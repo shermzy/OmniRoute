@@ -45,6 +45,20 @@ async function checked(path, init) {
   return body;
 }
 
+async function checkedError(path, expectedStatus, init) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    ...init,
+    headers: { ...headers, ...(init?.headers || {}) },
+    redirect: "error",
+    signal: AbortSignal.timeout(180_000),
+  });
+  const body = await readJson(response);
+  if (response.status !== expectedStatus) {
+    throw new Error(`${path} -> expected HTTP ${expectedStatus}, got ${response.status}: ${JSON.stringify(body)}`);
+  }
+  return body;
+}
+
 const health = await checked("/healthz");
 if (health?.ok !== true || health?.service !== "chat-on-steroids-runtime") {
   throw new Error(`Unexpected health response: ${JSON.stringify(health)}`);
@@ -60,6 +74,21 @@ if (!ids.includes(model)) {
   throw new Error(`${model} missing from model list: ${JSON.stringify(ids)}`);
 }
 console.log(`models: ${model} present`);
+
+const unsupported = await checkedError("/v1/chat/completions", 400, {
+  method: "POST",
+  headers: { "idempotency-key": `omniroute-cos-unsupported-${Date.now()}` },
+  body: JSON.stringify({
+    model,
+    stream: false,
+    max_tokens: 8,
+    messages: [{ role: "user", content: "This request must be rejected before browser delivery." }],
+  }),
+});
+if (unsupported?.error?.code !== "unsupported_parameter") {
+  throw new Error(`Unexpected unsupported-parameter response: ${JSON.stringify(unsupported)}`);
+}
+console.log("compatibility: max_tokens rejected at direct CoS ingress");
 
 const idem = `omniroute-cos-probe-${Date.now()}`;
 const body = JSON.stringify({
