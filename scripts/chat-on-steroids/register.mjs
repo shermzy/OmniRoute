@@ -151,6 +151,31 @@ async function ensureConnection(node) {
   return created.connection;
 }
 
+async function ensureParamFilters(connection) {
+  const url = `${omniBaseUrl}/api/providers/${encodeURIComponent(connection.id)}/param-filters`;
+  const existing = await request(url, { headers: omniHeaders });
+  const block = Array.isArray(existing?.block)
+    ? existing.block.filter((value) => typeof value === "string")
+    : [];
+  const allow = Array.isArray(existing?.allow)
+    ? existing.allow.filter((value) => typeof value === "string")
+    : [];
+  const required = "max_tokens";
+  if (!block.includes(required)) block.push(required);
+
+  await request(url, {
+    method: "PUT",
+    headers: omniHeaders,
+    body: JSON.stringify({
+      block,
+      allow,
+      ...(existing?.models && typeof existing.models === "object" ? { models: existing.models } : {}),
+      autoLearn: existing?.autoLearn === true,
+    }),
+  });
+  console.log(`OmniRoute param filters: ${required} blocked for ${connection.id}`);
+}
+
 async function testConnection(connection) {
   const result = await request(`${omniBaseUrl}/api/providers/${encodeURIComponent(connection.id)}/test`, {
     method: "POST",
@@ -180,6 +205,7 @@ try {
   await probeCos();
   const node = await ensureNode();
   const connection = await ensureConnection(node);
+  await ensureParamFilters(connection);
   await testConnection(connection);
   await syncModels(connection);
   console.log(`READY: select ${publicModel} in OmniRoute`);
