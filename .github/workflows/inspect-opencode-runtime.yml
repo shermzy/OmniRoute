@@ -413,7 +413,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for v in COOLIFY_URL COOLIFY_API_TOKEN SERVICE_UUID APP_UUID DIGEST; do
+          COOLIFY_URL="${COOLIFY_URL:-https://t3ai.xyz}"
+          for v in COOLIFY_API_TOKEN SERVICE_UUID APP_UUID DIGEST; do
             if [ -z "${!v:-}" ]; then
               echo "::error::Missing required deployment value: $v"
               exit 1
