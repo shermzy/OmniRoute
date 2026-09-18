@@ -23,19 +23,45 @@ jobs:
       - name: Pull current mirrored upstream channel
         run: docker pull ghcr.io/diegosouzapw/omniroute:next
 
-      - name: Inspect standalone layout and OpenCode strings
+      - name: Inspect exact OpenCode source and compiled chunk
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm --entrypoint sh ghcr.io/diegosouzapw/omniroute:next -lc '
-            echo "=== TOP ==="
-            find /app -maxdepth 3 -type f | sort | head -n 300
-            echo "=== OPENCODE_FILENAMES ==="
-            find /app -type f -iname "*opencode*" | sort | head -n 200
-            echo "=== SESSION_STRING_MATCHES ==="
-            grep -R -l --binary-files=without-match "x-opencode-session" /app 2>/dev/null | head -n 100 || true
-            echo "=== SYNTHESIS_STRING_MATCHES ==="
-            grep -R -l --binary-files=without-match "OPENCODE_SYNTHESIZE_CLI_HEADERS" /app 2>/dev/null | head -n 100 || true
-            echo "=== ZEN_URL_MATCHES ==="
-            grep -R -l --binary-files=without-match "opencode.ai/zen/v1" /app 2>/dev/null | head -n 100 || true
-          '
+          docker run --rm -i --entrypoint node ghcr.io/diegosouzapw/omniroute:next --input-type=module - <<'NODE'
+          import fs from "node:fs";
+          import crypto from "node:crypto";
+
+          const files = [
+            "/app/open-sse/executors/opencode.ts",
+            "/app/.build/next/server/chunks/45782.js",
+          ];
+          const needles = [
+            "OPENCODE_SYNTHESIZE_CLI_HEADERS",
+            "x-opencode-session",
+            "opencode.ai/zen/v1",
+            "muse-spark",
+            "forwardOpencodeClientHeaders",
+            "transformRequest(",
+          ];
+
+          for (const file of files) {
+            const body = fs.readFileSync(file, "utf8");
+            console.log("\n=== FILE ===", file);
+            console.log("SHA256", crypto.createHash("sha256").update(body).digest("hex"));
+            console.log("SIZE", body.length);
+            for (const needle of needles) {
+              let from = 0;
+              let count = 0;
+              while (count < 3) {
+                const i = body.indexOf(needle, from);
+                if (i < 0) break;
+                count++;
+                const start = Math.max(0, i - 1400);
+                const end = Math.min(body.length, i + needle.length + 4200);
+                console.log("\n--- NEEDLE", JSON.stringify(needle), "MATCH", count, "AT", i, "---");
+                console.log(body.slice(start, end).replace(/[\r\n]+/g, " "));
+                from = i + needle.length;
+              }
+            }
+          }
+          NODE
