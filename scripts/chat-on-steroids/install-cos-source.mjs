@@ -5,8 +5,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-const COS_VERSION = '2.1.0';
-const COS_PINNED_COMMIT = '1517d66dac1e7452f63b7452c88479c92a554768';
+const COS_VERSION = '2.1.11';
+const COS_PINNED_COMMIT = 'f51acbccdd734f524799ea92bb747be765fba1e4';
 const cosDir = process.env.COS_SOURCE_DIR ? path.resolve(process.env.COS_SOURCE_DIR) : null;
 if (!cosDir) {
   console.error(`COS_SOURCE_DIR is required and must point to a writable Chat On Steroids ${COS_VERSION} checkout`);
