@@ -20,14 +20,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull current production base image
-        run: docker pull ghcr.io/diegosouzapw/omniroute:3.8.51
+      - name: Pull current mirrored upstream channel
+        run: docker pull ghcr.io/diegosouzapw/omniroute:next
 
       - name: Locate compiled OpenCode runtime code
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -i --entrypoint node ghcr.io/diegosouzapw/omniroute:3.8.51 --input-type=module - <<'NODE'
+          docker run --rm -i --entrypoint node ghcr.io/diegosouzapw/omniroute:next --input-type=module - <<'NODE'
           import fs from "node:fs";
           import path from "node:path";
 
@@ -53,19 +53,18 @@ jobs:
               return;
             }
             if (!/\.(?:js|mjs|cjs)$/.test(p) || stat.size > 12_000_000) return;
-            let text;
-            try { text = fs.readFileSync(p, "utf8"); } catch { return; }
-            const hits = needles.filter((n) => text.includes(n));
-            if (!hits.length) return;
-            if (seen.has(p)) return;
+            let body;
+            try { body = fs.readFileSync(p, "utf8"); } catch { return; }
+            const hits = needles.filter((n) => body.includes(n));
+            if (!hits.length || seen.has(p)) return;
             seen.add(p);
             console.log("\nFILE", p, "SIZE", stat.size, "HITS", hits.join(","));
             for (const needle of hits) {
-              const i = text.indexOf(needle);
+              const i = body.indexOf(needle);
               const start = Math.max(0, i - 500);
-              const end = Math.min(text.length, i + needle.length + 1200);
+              const end = Math.min(body.length, i + needle.length + 1200);
               console.log("NEEDLE", needle);
-              console.log(text.slice(start, end).replace(/[\r\n]+/g, " "));
+              console.log(body.slice(start, end).replace(/[\r\n]+/g, " "));
             }
           }
 
