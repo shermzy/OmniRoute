@@ -437,14 +437,12 @@ jobs:
         env:
           COOLIFY_URL: ${{ secrets.COOLIFY_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
-          SERVICE_UUID: ${{ vars.COOLIFY_SERVICE_UUID }}
-          APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
           DIGEST: ${{ steps.push.outputs.digest }}
         shell: bash
         run: |
           set -euo pipefail
           COOLIFY_URL="${COOLIFY_URL:-https://t3ai.xyz}"
-          for v in COOLIFY_API_TOKEN SERVICE_UUID APP_UUID DIGEST; do
+          for v in COOLIFY_API_TOKEN DIGEST; do
             if [ -z "${!v:-}" ]; then
               echo "::warning::Missing required Coolify deployment value: $v"
               echo "deployed=false" >> "$GITHUB_OUTPUT"
@@ -454,23 +452,76 @@ jobs:
           IMAGE_REF="ghcr.io/shermzy/omniroute@$DIGEST"
 
           auth_status="$(curl -sS \
-            -o /tmp/coolify-auth.json -w '%{http_code}' \
+            -o /tmp/coolify-services.json -w '%{http_code}' \
             -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
             -H 'Accept: application/json' \
             "$COOLIFY_URL/api/v1/services" || true)"
           echo "coolify_auth_status=$auth_status"
           if [ "$auth_status" != "200" ]; then
-            message="$(jq -r '.message // "Coolify authentication probe failed"' /tmp/coolify-auth.json 2>/dev/null || echo "Coolify authentication probe failed")"
+            message="$(jq -r '.message // "Coolify authentication probe failed"' /tmp/coolify-services.json 2>/dev/null || echo "Coolify authentication probe failed")"
             echo "::warning title=Coolify deploy unavailable::$message"
             echo "deployed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          : > /tmp/coolify-domain-matches.tsv
+          : > /tmp/coolify-name-fallback.tsv
+          while IFS=$'\t' read -r service_uuid service_name; do
+            [ -n "$service_uuid" ] || continue
+            apps_status="$(curl -sS \
+              -o "/tmp/coolify-apps-$service_uuid.json" -w '%{http_code}' \
+              -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+              -H 'Accept: application/json' \
+              "$COOLIFY_URL/api/v1/services/$service_uuid/applications" || true)"
+            [ "$apps_status" = "200" ] || continue
+
+            jq -r --arg service "$service_uuid" '
+              .[]?
+              | select((tostring | ascii_downcase | contains("omni.t3.group")))
+              | [$service, (.uuid // "")]
+              | @tsv
+            ' "/tmp/coolify-apps-$service_uuid.json" >> /tmp/coolify-domain-matches.tsv
+
+            if printf '%s' "$service_name" | grep -qi 'omniroute'; then
+              jq -r --arg service "$service_uuid" '
+                .[]?
+                | [$service, (.uuid // "")]
+                | @tsv
+              ' "/tmp/coolify-apps-$service_uuid.json" >> /tmp/coolify-name-fallback.tsv
+            fi
+          done < <(jq -r '.[]? | [(.uuid // ""), (.name // "")] | @tsv' /tmp/coolify-services.json)
+
+          sort -u /tmp/coolify-domain-matches.tsv -o /tmp/coolify-domain-matches.tsv
+          sort -u /tmp/coolify-name-fallback.tsv -o /tmp/coolify-name-fallback.tsv
+          match_count="$(awk 'NF {n++} END {print n+0}' /tmp/coolify-domain-matches.tsv)"
+          if [ "$match_count" = "1" ]; then
+            IFS=$'\t' read -r SERVICE_UUID APP_UUID < /tmp/coolify-domain-matches.tsv
+            resolution="domain"
+          elif [ "$match_count" = "0" ]; then
+            fallback_count="$(awk 'NF {n++} END {print n+0}' /tmp/coolify-name-fallback.tsv)"
+            if [ "$fallback_count" != "1" ]; then
+              echo "::error::Could not resolve exactly one OmniRoute service application (domain matches=$match_count, name fallback=$fallback_count). Refusing deployment."
+              exit 1
+            fi
+            IFS=$'\t' read -r SERVICE_UUID APP_UUID < /tmp/coolify-name-fallback.tsv
+            resolution="unique omniroute-named service/application"
+          else
+            echo "::error::Found $match_count Coolify applications referencing omni.t3.group; refusing ambiguous deployment."
+            exit 1
+          fi
+          if [ -z "${SERVICE_UUID:-}" ] || [ -z "${APP_UUID:-}" ]; then
+            echo "::error::Resolved Coolify target is missing a UUID; refusing deployment."
+            exit 1
+          fi
+          echo "coolify_target_resolution=$resolution"
+          echo "coolify_service_uuid=$SERVICE_UUID"
+          echo "coolify_app_uuid=$APP_UUID"
+
           current="$(curl -fsS \
             -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
             -H 'Accept: application/json' \
             "$COOLIFY_URL/api/v1/services/$SERVICE_UUID/applications/$APP_UUID")"
-          echo "coolify_target_name=$(echo "$current" | jq -r '.name // .uuid // "unknown"')"
+          echo "coolify_target_name=$(echo "$current" | jq -r '.human_name // .name // .uuid // "unknown"')"
           echo "coolify_previous_image=$(echo "$current" | jq -r '.image // "unknown"')"
 
           curl -fsS -X PATCH \
