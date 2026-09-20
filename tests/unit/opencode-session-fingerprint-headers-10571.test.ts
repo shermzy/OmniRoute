@@ -160,7 +160,7 @@ test("OpencodeExecutor.buildHeaders derives a stable x-opencode-session from the
   assert.equal(headersFirst["x-opencode-session"], headersSecond["x-opencode-session"]);
 });
 
-test("Responses requests use a UUID x-opencode-session for Muse compatibility", () => {
+test("anonymous free Responses requests keep the canonical OpenCode session identity", () => {
   const executor = new OpencodeExecutor("opencode");
   executor._requestFormat = "openai-responses";
   const headers = executor.buildHeaders(
@@ -176,8 +176,8 @@ test("Responses requests use a UUID x-opencode-session for Muse compatibility", 
   );
   assert.match(
     headers["x-opencode-session"] ?? "",
-    UUID_RE,
-    "Responses transport must use a UUID session"
+    /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/,
+    "anonymous free Responses transport must retain the official OpenCode session identity"
   );
 });
 

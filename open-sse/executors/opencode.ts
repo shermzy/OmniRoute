@@ -16,7 +16,7 @@ import {
   runWithDirectFetchContext,
   runWithProxyContext,
 } from "../utils/proxyFetch.ts";
-import { forwardOpencodeClientHeaders } from "../utils/opencodeHeaders.ts";
+import { applyAnonymousFreeOpencodeHeaders, forwardOpencodeClientHeaders } from "../utils/opencodeHeaders.ts";
 import {
   type AccountProxyConfig,
   type RotatableAccount,
@@ -29,6 +29,8 @@ import {
   extractChatcmplId,
 } from "./accountRotation.ts";
 import { isNetworkRotationSharedEgressGuardEnabled } from "@/shared/utils/featureFlags";
+
+const ZEN_BASE_URL = "https://opencode.ai/zen/v1";
 
 /**
  * Per-account proxy configuration, persisted by NoAuthAccountCard under
@@ -262,6 +264,23 @@ function isResponsesTerminalLine(line: string): boolean {
 }
 
 export class OpencodeExecutor extends BaseExecutor {
+  private isAnonymousFreeZenRequest(
+    model: string,
+    credentials: ProviderCredentials | null,
+    resolvedKey?: string
+  ): boolean {
+    const hasConfiguredKey =
+      resolvedKey ||
+      credentials?.apiKey ||
+      credentials?.accessToken ||
+      credentials?.providerSpecificData?.extraApiKeys;
+    return (
+      !hasConfiguredKey &&
+      this.config?.baseUrl === ZEN_BASE_URL &&
+      !isPremiumOpencodeModel(model, this.provider)
+    );
+  }
+
   /** Delegates to `isPremiumOpencodeModel`. Exported for testability. */
   static isPremiumModel(model: string, provider: string): boolean {
     return isPremiumOpencodeModel(model, provider);
@@ -726,6 +745,7 @@ export class OpencodeExecutor extends BaseExecutor {
     const key = credentials
       ? this.resolveEffectiveKey(credentials) || credentials.accessToken
       : undefined;
+    const anonymousFreeZen = this.isAnonymousFreeZenRequest(model ?? "", credentials, key);
 
     if (key) {
       if (this._requestFormat === "claude") {
@@ -733,13 +753,15 @@ export class OpencodeExecutor extends BaseExecutor {
       } else {
         headers["Authorization"] = `Bearer ${key}`;
       }
+    } else if (anonymousFreeZen) {
+      headers["Authorization"] = "Bearer public";
     }
 
     if (this._requestFormat === "claude") {
       headers["anthropic-version"] = "2023-06-01";
     }
 
-    if (stream) {
+    if (stream || anonymousFreeZen) {
       headers["Accept"] = "text/event-stream";
     }
 
@@ -751,7 +773,7 @@ export class OpencodeExecutor extends BaseExecutor {
     const synthesizeCli = !/^(0|false|no|off)$/i.test(
       process.env.OPENCODE_SYNTHESIZE_CLI_HEADERS?.trim() ?? ""
     );
-    const cliDefaults = synthesizeCli
+    const cliDefaults = synthesizeCli && !anonymousFreeZen
       ? (() => {
           const providerId = this.config?.id || this.provider || "opencode";
           const envUAKey = `${providerId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_USER_AGENT`;
@@ -786,11 +808,19 @@ export class OpencodeExecutor extends BaseExecutor {
       });
     }
 
+    // Anonymous free Zen requires the exact CLI identity even when the caller
+    // supplied generic OpenAI client headers. Apply this last so curl/SDK
+    // User-Agent and non-canonical OpenCode metadata cannot overwrite it.
+    if (anonymousFreeZen) {
+      applyAnonymousFreeOpencodeHeaders(headers, clientHeaders ?? {});
+    }
+
     // Muse's Responses endpoint rejects the short conversation fingerprint used
     // by the Chat endpoint in practice. Keep the workaround scoped to Muse.
     if (
       this._requestFormat === "openai-responses" &&
       model.startsWith("muse-spark") &&
+      isPremiumOpencodeModel(model, this.provider) &&
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
         headers["x-opencode-session"] || ""
       )
@@ -882,6 +912,41 @@ export class OpencodeExecutor extends BaseExecutor {
   ): any {
     let modifiedBody = super.transformRequest(model, body, stream, credentials);
     modifiedBody = this.applyDeepSeekJsonSchemaFallback(model, modifiedBody);
+
+    if (
+      this.isAnonymousFreeZenRequest(model, credentials) &&
+      modifiedBody &&
+      typeof modifiedBody === "object" &&
+      !Array.isArray(modifiedBody)
+    ) {
+      const freeBody = modifiedBody as Record<string, unknown>;
+      // OpenCode 1.18.31 free-tier requests are streaming and carry at least one
+      // tool definition. The upstream gateway rejects a generic OpenAI-shaped
+      // anonymous request even when its IP and model are otherwise accepted.
+      freeBody.stream = true;
+      if (!Array.isArray(freeBody.tools) || freeBody.tools.length === 0) {
+        freeBody.tools =
+          this._requestFormat === "openai-responses"
+            ? [
+                {
+                  type: "function",
+                  name: "_noop",
+                  description: "Do not call this tool. It exists only for API compatibility.",
+                  parameters: { type: "object", properties: {} },
+                },
+              ]
+            : [
+                {
+                  type: "function",
+                  function: {
+                    name: "_noop",
+                    description: "Do not call this tool. It exists only for API compatibility.",
+                    parameters: { type: "object", properties: {} },
+                  },
+                },
+              ];
+      }
+    }
     // 9router#1442: OpenCode upstreams (e.g. kimi-k2.6 via opencode-go) return
     // 400 "Extra inputs are not permitted, field: 'client_metadata'" — an
     // OpenAI-Codex/Claude-CLI passthrough field with no equivalent here. The
