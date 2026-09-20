@@ -1,7 +1,6 @@
 name: Nightly Mutation
+# Automatic schedule disabled to stop hosted runner spend; use workflow_dispatch when needed.
 on:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
