@@ -2,7 +2,7 @@ name: Mirror image to shermzy GHCR
 
 # Fork-only deployment automation — NOT for the diegosouzapw upstream.
 #
-# The Coolify "omniroute" service (t3ai.xyz) runs a docker-compose service
+# The Coolify "omniroute" service (cc.t3.group) runs a docker-compose service
 # pinned by digest to ghcr.io/shermzy/omniroute, not a git-connected app that
 # rebuilds on push. Upstream's own docker-publish.yml only ever publishes to
 # ghcr.io/diegosouzapw/omniroute and Docker Hub — it has no knowledge of this
@@ -16,7 +16,9 @@ name: Mirror image to shermzy GHCR
 #      hosted runner: build.yml (#11946) documents that tree OOM-killing the
 #      hosted 7 GB runner, which is why that workflow is manual-dispatch-only.
 #   3. Patch the Coolify service application's `image` field to the new
-#      digest and restart it so the compose service actually redeploys.
+#      digest and trigger a full service redeploy so the compose service is
+#      recreated on the new image (a plain container restart keeps the old
+#      image — verified 2026-09-28).
 #
 # Requires repo secrets COOLIFY_URL and COOLIFY_API_TOKEN (a *write*-capable
 # Coolify API token — the read-only variant cannot PATCH), and repo variables
@@ -33,7 +35,7 @@ on:
         type: string
         default: "next"
       deploy:
-        description: "Also patch + restart the Coolify service after mirroring"
+        description: "Also patch + redeploy the Coolify service after mirroring"
         required: false
         type: boolean
         default: true
@@ -147,8 +149,8 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg image "$IMAGE_REF" '{image: $image}')"
 
-          echo "Patched image to $IMAGE_REF — restarting container…"
+          echo "Patched image to $IMAGE_REF — redeploying service so the new image is picked up (a plain restart keeps the old image)…"
           curl -sf -X POST \
-            "$COOLIFY_URL/api/v1/services/$SERVICE_UUID/applications/$APP_UUID/restart" \
+            "$COOLIFY_URL/api/v1/deploy?uuid=$SERVICE_UUID" \
             -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
             -H "User-Agent: omniroute-mirror-ci/1.0"
