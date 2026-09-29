@@ -1,9 +1,8 @@
 name: Quality Gates
 
+# Automatic pull-request trigger disabled to stop hosted runner spend.
+# Use workflow_dispatch for an intentional validation run.
 on:
-  pull_request:
-    branches: ["release/**"]
-    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 concurrency:

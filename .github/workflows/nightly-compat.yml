@@ -3,13 +3,11 @@ name: Nightly Node Compat
 # Plano mestre testes+CI (Eixo D2, aprovado 2026-07-04): as matrizes de compatibilidade
 # Node 24/26 custavam ~28% de CADA run do CI pesado (2 execuções completas da suíte por
 # sync da release-PR) para pegar uma classe de quebra que raramente nasce num PR típico.
-# Elas rodam aqui 1×/dia contra o tip da release ativa (mesmo alvo do nightly-release-green)
+# Automatic execution is disabled to stop hosted runner spend; use workflow_dispatch when needed.
 # e continuam obrigatórias no gate de release via workflow_dispatch do ci.yml se preciso.
 # fail-fast desligado: numa quebra queremos saber TODAS as versões afetadas de uma vez.
 
 on:
-  schedule:
-    - cron: "47 6 * * *" # 06:47 UTC diário — slot distinto dos demais nightlies
   workflow_dispatch:
     inputs:
       branch:
