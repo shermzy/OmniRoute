@@ -17,6 +17,8 @@ on:
         required: false
         type: string
 
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
 permissions:
   contents: read
   issues: write
@@ -27,6 +29,7 @@ concurrency:
 
 jobs:
   resolve-branch:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     name: Resolve active release branch
     runs-on: ubuntu-latest
     outputs:
@@ -40,9 +43,13 @@ jobs:
         id: branch
         env:
           INPUT_BRANCH: ${{ github.event.inputs.branch }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          if [ -n "${INPUT_BRANCH:-}" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # PR runs validate the merge ref for this exact labeled PR.
+            TARGET="$GITHUB_SHA"
+          elif [ -n "${INPUT_BRANCH:-}" ]; then
             TARGET="$INPUT_BRANCH"
           else
             TARGET=$(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/release/v*' \
@@ -50,13 +57,16 @@ jobs:
               | sort -t/ -k2 -V \
               | tail -1)
           fi
-          case "$TARGET" in
-            release/v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "Refusing non-canonical branch name: $TARGET"; exit 1 ;;
-          esac
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            case "$TARGET" in
+              release/v[0-9]*.[0-9]*.[0-9]*) ;;
+              *) echo "Refusing non-canonical branch name: $TARGET"; exit 1 ;;
+            esac
+          fi
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
 
   compat-build-26:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     name: Node 26 Compatibility Build
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -87,6 +97,7 @@ jobs:
           OMNIROUTE_USE_TURBOPACK: "0"
 
   compat-tests:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     name: Node ${{ matrix.node }} Compat Tests (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -117,7 +128,7 @@ jobs:
   report:
     name: Open / update tracking issue on failure
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() && (needs.compat-tests.result == 'failure' || needs.compat-build-26.result == 'failure') }}
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (needs.compat-tests.result == 'failure' || needs.compat-build-26.result == 'failure') }}
     needs: [resolve-branch, compat-build-26, compat-tests]
     permissions:
       issues: write

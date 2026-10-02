@@ -1,9 +1,10 @@
 name: Quality Gates
 
 on:
+  schedule:
+    - cron: "45 21 * * *"
   pull_request:
-    branches: ["release/**"]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
   workflow_dispatch:
 
 concurrency:
@@ -21,9 +22,9 @@ env:
   CI_NODE_VERSION: "24"
 
 jobs:
-  # Same classifier as ci.yml (scripts/quality/classify-pr-changes.mjs) so PR→release
-  # path filters share existence reasons: code / docs / i18n / workflow.
+  # Release-labeled PRs bypass change classification so every quality lane runs.
   changes:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     name: Change Classification
     runs-on: ubuntu-latest
     outputs:
@@ -42,10 +43,11 @@ jobs:
       - id: classify
         env:
           EVENT_NAME: ${{ github.event_name }}
+          RELEASE_PR: ${{ github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [ "$EVENT_NAME" != "pull_request" ]; then
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$RELEASE_PR" = "true" ]; then
             {
               echo "code=true"
               echo "docs=true"
@@ -79,7 +81,7 @@ jobs:
     # is nightly-release-green (omni-build); for main it is ci.yml `Build`.
     # Restore this job when a runner that actually fits the tree is wired here.
     # Bare `false` (not `${{ false }}`) — zizmor obfuscation flags the expression form.
-    if: false
+    if: ${{ (false) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     # PINNED to hosted — this was the last job in THIS workflow still on the USE_VPS_RUNNER
     # switch (ci.yml's Build, nightly-release-green and npm-publish keep it, so the variable
     # stays meaningful), and with USE_VPS_RUNNER=true it produced NO signal at all here.
@@ -139,7 +141,7 @@ jobs:
   docs-gates:
     name: Docs Gates (fast-path)
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || ((github.event.pull_request.draft == false || startsWith(github.head_ref, 'mergify/merge-queue/')) && (needs.changes.outputs.docs == 'true' || needs.changes.outputs.code == 'true')) }}
+    if: ${{ (github.event_name != 'pull_request' || ((true) && (needs.changes.outputs.docs == 'true' || needs.changes.outputs.code == 'true'))) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -159,7 +161,7 @@ jobs:
     name: Fast Quality Gates
     needs: changes
     # Code surface only — pure docs/i18n PRs skip this bag (docs-gates covers docs).
-    if: ${{ github.event_name != 'pull_request' || ((github.event.pull_request.draft == false || startsWith(github.head_ref, 'mergify/merge-queue/')) && needs.changes.outputs.code == 'true') }}
+    if: ${{ (github.event_name != 'pull_request' || ((true) && needs.changes.outputs.code == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     # Dynamic runner (same rule as ci.yml): use the self-hosted VPS pool only when the
     # release captain has USE_VPS_RUNNER=true AND this is not a fork PR (own-origin
     # branches only — a fork PR must never execute on the LAN runner). Var unset/false
@@ -250,6 +252,7 @@ jobs:
           "$HOME/.local/bin/oasdiff" --version || true
           zizmor --version || true
       - name: Forgotten sibling tests (advisory)
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -366,6 +369,7 @@ jobs:
       # BLOCKING for the *impacted subset* (flipped 2026-06-17). Fail-safe full
       # coverage remains required via `Unit Tests fast-path` (fast-unit).
       - name: Impacted unit tests (TIA subset; blocking)
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
         run: |
@@ -429,7 +433,7 @@ jobs:
   fast-vitest:
     name: Vitest (fast-path)
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || ((github.event.pull_request.draft == false || startsWith(github.head_ref, 'mergify/merge-queue/')) && needs.changes.outputs.code == 'true') }}
+    if: ${{ (github.event_name != 'pull_request' || ((true) && needs.changes.outputs.code == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     # Dynamic runner — see fast-gates (own-origin + flag; fork/unset → ubuntu-latest).
     # PINNED to hosted, deliberately not on the USE_VPS_RUNNER switch (gap 19). One variable
     # governed the build and the test jobs, which want OPPOSITE machines: the build needs the
@@ -467,7 +471,7 @@ jobs:
   fast-unit:
     name: Unit Tests fast-path (${{ matrix.shard }}/4)
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || ((github.event.pull_request.draft == false || startsWith(github.head_ref, 'mergify/merge-queue/')) && needs.changes.outputs.code == 'true') }}
+    if: ${{ (github.event_name != 'pull_request' || ((true) && needs.changes.outputs.code == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     # Dynamic runner — see fast-gates (own-origin + flag; fork/unset → ubuntu-latest).
     # This is the heaviest fast-path job; 4-way sharding (was 2, #6781) halves the
     # critical path again (~8.5min → ~4.5min on ubuntu-latest; ~2min on the 8-slot
@@ -525,7 +529,7 @@ jobs:
   lint-guard:
     name: No new ESLint warnings
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || ((github.event.pull_request.draft == false || startsWith(github.head_ref, 'mergify/merge-queue/')) && needs.changes.outputs.code == 'true') }}
+    if: ${{ (github.event_name != 'pull_request' || ((true) && needs.changes.outputs.code == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     runs-on: ${{ (vars.USE_VPS_RUNNER == 'true' && fromJSON('["self-hosted","omni-light"]')) || 'ubuntu-latest' }}
     # 2026-08-30: a cold full lint with the eslint-plugin-react-hooks 7 compiler rules is
     # killed on the 7 GB hosted runner without a message (status null → exit 1, the
@@ -600,8 +604,8 @@ jobs:
   # nunca é bloqueado.
   merge-integrity:
     name: Merge integrity (changelog + generated skills)
-    # Always on non-draft PRs — CHANGELOG/skills can break on docs-only merges too.
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false || startsWith(github.head_ref, 'mergify/merge-queue/')) }}
+    # Release-labeled PRs also validate merge integrity before they reach the release branch.
+    if: ${{ (github.event_name != 'pull_request' || (true)) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     runs-on: ubuntu-latest
     continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
     env:

@@ -4,11 +4,14 @@ on:
     - cron: "23 4 * * *"
   workflow_dispatch:
 
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
 permissions:
   contents: read
 
 jobs:
   schemathesis:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     name: Schemathesis — OpenAPI contract fuzz (advisory)
     # #11965: this job runs a backend-only `next build`; the hosted 7 GB runner cannot build
     # release/v3.8.51 (VM shutdown ~7 min in), so it targets the box's light pool (`omni-light`:
