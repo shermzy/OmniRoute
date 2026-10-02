@@ -1,13 +1,7 @@
 name: DAST smoke (PR)
 on:
   pull_request:
-    branches: ["main", "release/**"]
-    # Runner-cost guard (#8084): the CLI-bundle build alone is 6-11min; a docs-only PR
-    # cannot change DAST behavior, so skip the whole workflow for pure docs/markdown
-    # changes. Any code path in the diff still runs the full smoke.
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
 permissions:
   contents: read
 
@@ -18,6 +12,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   dast-smoke:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     runs-on: ubuntu-latest
     # ADVISORY while this new gate matures (repo convention: advisory -> blocking).
     # Flip to blocking (remove continue-on-error) once it's proven stable across a few PRs.

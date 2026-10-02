@@ -1,11 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
   workflow_dispatch:
 
 concurrency:
@@ -26,6 +23,7 @@ env:
 
 jobs:
   changes:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     name: Change Classification
     runs-on: ubuntu-latest
     outputs:
@@ -57,17 +55,19 @@ jobs:
       - id: classify
         env:
           EVENT_NAME: ${{ github.event_name }}
+          RELEASE_PR: ${{ github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # Single source of truth: scripts/quality/classify-pr-changes.mjs
           # (unit-tested). Push/dispatch always enable every lane.
-          if [ "$EVENT_NAME" != "pull_request" ]; then
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$RELEASE_PR" = "true" ]; then
             {
               echo "code=true"
               echo "docs=true"
               echo "i18n=true"
               echo "workflow=true"
+              echo "testsOnly=false"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -79,11 +79,10 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     needs: changes
-    # P3 (plano mestre): a release-PR viva fica DRAFT o ciclo inteiro — jobs pesados pulam
-    # drafts (ciclo v3.8.44: 123 runs pesados re-disparados por merges na release, 88 cancelados).
-    # Path filter: pure docs / pure message-catalog PRs skip the code lint bag + typecheck.
+    # The release label starts the full CI path, including this lane.
+    # Release-labeled PRs bypass change classification and run the complete code lane.
     # Existence reason of this job is code regression; docs/i18n have dedicated jobs.
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.code == 'true') }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     env:
       # tsx gates below (known-symbols, route-guard-membership) import modules that
       # open SQLite on load; provide DB env so a fresh CI DB initializes cleanly.
@@ -183,8 +182,8 @@ jobs:
     # release PR #4854, where the drift cascade only surfaced post-merge in #5029).
     # The coverage.* metrics degrade gracefully: the download is continue-on-error and
     # the ratchet runs with --allow-missing, so absent coverage is skipped, not failed.
-    # Path filter: code-only — pure docs/i18n PRs have nothing for these ratchets to guard.
-    if: ${{ !cancelled() && !contains(github.event.pull_request.labels.*.name, 'hotfix') && (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.code == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'failure'))) }}
+    # Release-labeled PRs run the ratchets regardless of the changed-file mix.
+    if: ${{ (!cancelled() && (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && (needs.lint.result == 'success' || needs.lint.result == 'failure')))) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     # security-events: read lets the CodeQL ratchet read open code-scanning alerts
     # via `gh api .../code-scanning/alerts`. contents: read keeps checkout working.
     permissions:
@@ -291,10 +290,9 @@ jobs:
     name: Quality Gates (Extended)
     runs-on: ubuntu-latest
     needs: changes
-    # P3 (plano mestre): a release-PR viva fica DRAFT o ciclo inteiro — jobs pesados pulam
-    # drafts (ciclo v3.8.44: 123 runs pesados re-disparados por merges na release, 88 cancelados).
-    # Path filter: code-only (scanners/ratchets target production surface).
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'hotfix') && (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.code == 'true')) }}
+    # The release label starts the full CI path, including this lane.
+    # Release-labeled PRs run all scanners and ratchets.
+    if: ${{ ((github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true'))) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     steps:
       # fetch-depth: 0 — the OpenAPI breaking-change gate (oasdiff) reads the base
       # spec via `git show <base_ref>:docs/openapi.yaml`; a shallow clone
@@ -411,10 +409,9 @@ jobs:
     name: Docs Sync (Strict)
     runs-on: ubuntu-latest
     needs: changes
-    # P3 (plano mestre): a release-PR viva fica DRAFT o ciclo inteiro — jobs pesados pulam
-    # drafts (ciclo v3.8.44: 123 runs pesados re-disparados por merges na release, 88 cancelados).
+    # The release label starts the full CI path, including this lane.
     # Run when docs OR code change: API/route code can break doc/OpenAPI contract gates.
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && (needs.changes.outputs.docs == 'true' || needs.changes.outputs.code == 'true')) }}
+    if: ${{ (github.event_name != 'pull_request' || ((needs.changes.outputs.docs == 'true' || needs.changes.outputs.code == 'true'))) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -444,10 +441,9 @@ jobs:
     name: Docs Lint (prose — advisory)
     runs-on: ubuntu-latest
     needs: changes
-    # P3 (plano mestre): a release-PR viva fica DRAFT o ciclo inteiro — jobs pesados pulam
-    # drafts (ciclo v3.8.44: 123 runs pesados re-disparados por merges na release, 88 cancelados).
+    # The release label starts the full CI path, including this lane.
     # Prose/markdown only — skip when the PR has no doc surface.
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.docs == 'true') }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.docs == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     # Advisory (warning-first): prose/markdown style must not block merges while the
     # existing doc corpus is brought up to style. Promote to blocking once it converges.
     continue-on-error: true
@@ -475,10 +471,9 @@ jobs:
     name: i18n UI Coverage
     runs-on: ubuntu-latest
     needs: changes
-    # P3 (plano mestre): a release-PR viva fica DRAFT o ciclo inteiro — jobs pesados pulam
-    # drafts (ciclo v3.8.44: 123 runs pesados re-disparados por merges na release, 88 cancelados).
+    # The release label starts the full CI path, including this lane.
     # UI keys move with dashboard code OR message catalogs.
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && (needs.changes.outputs.i18n == 'true' || needs.changes.outputs.code == 'true')) }}
+    if: ${{ (github.event_name != 'pull_request' || ((needs.changes.outputs.i18n == 'true' || needs.changes.outputs.code == 'true'))) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     steps:
       # fetch-depth: 0 — the value-drift gate diffs en.json against the merge base to
       # find rewritten English strings. On a shallow clone the base ref is missing and
@@ -510,7 +505,7 @@ jobs:
     name: i18n Glossary (zh-CN, ko)
     runs-on: ubuntu-latest
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && (needs.changes.outputs.i18n == 'true' || needs.changes.outputs.code == 'true')) }}
+    if: ${{ (github.event_name != 'pull_request' || ((needs.changes.outputs.i18n == 'true' || needs.changes.outputs.code == 'true'))) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -532,10 +527,9 @@ jobs:
     name: i18n Validation (all languages)
     runs-on: ubuntu-latest
     needs: changes
-    # P3 (plano mestre): a release-PR viva fica DRAFT o ciclo inteiro — jobs pesados pulam
-    # drafts (ciclo v3.8.44: 123 runs pesados re-disparados por merges na release, 88 cancelados).
+    # The release label starts the full CI path, including this lane.
     # Message-catalog / i18n-tooling only — pure code without i18n surface skips this lane.
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.i18n == 'true') }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.i18n == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
@@ -572,7 +566,7 @@ jobs:
 
   pr-test-policy:
     name: PR Test Policy
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false }}
+    if: ${{ (github.event_name == 'pull_request') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -624,7 +618,7 @@ jobs:
     concurrency:
       group: heavy-build-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}
       cancel-in-progress: false
-    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false) }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' )) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -668,6 +662,7 @@ jobs:
           retention-days: 1
 
   package-artifact:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     name: Package Artifact
     runs-on: ubuntu-latest
     needs: build
@@ -751,6 +746,7 @@ jobs:
         run: npm run check:pack-boot
 
   electron-package-smoke:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     name: Electron Package Smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -830,7 +826,7 @@ jobs:
     # needs: build. The `if` mirrors Build's own skip condition so docs-only PRs
     # still skip the suite.
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false) }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' )) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     strategy:
       fail-fast: false
       matrix:
@@ -898,7 +894,7 @@ jobs:
     continue-on-error: ${{ matrix.os == 'windows-latest' }}
     timeout-minutes: 10
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false) }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' )) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -932,7 +928,7 @@ jobs:
     timeout-minutes: 15
     # needs: changes (not build) — no artifact consumed; see test-unit note.
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false) }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' )) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     env:
       JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
       API_KEY_SECRET: ci-test-api-key-secret-long
@@ -982,7 +978,7 @@ jobs:
     # blocking job was green. The upload step now has its own ceiling; this is headroom.
     timeout-minutes: 30
     needs: test-unit
-    if: ${{ !cancelled() && needs.test-unit.result == 'success' && !contains(github.event.pull_request.labels.*.name, 'hotfix') }}
+    if: ${{ (!cancelled() && needs.test-unit.result == 'success') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     env:
       JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
       API_KEY_SECRET: ci-test-api-key-secret-long
@@ -1086,7 +1082,7 @@ jobs:
     # Temporarily opt-in: the private project currently has no Sonar quota.
     # Re-enable without another code change by setting the repository Actions
     # variable SONARQUBE_ENABLED=true after quota/project access is restored.
-    if: ${{ vars.SONARQUBE_ENABLED == 'true' && !cancelled() && needs.test-coverage.result == 'success' }}
+    if: ${{ (vars.SONARQUBE_ENABLED == 'true' && !cancelled() && needs.test-coverage.result == 'success') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     env:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
@@ -1137,7 +1133,7 @@ jobs:
   coverage-pr-comment:
     name: PR Coverage Comment
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.draft == false && github.event.pull_request.head.repo.fork == false && needs.changes.outputs.code == 'true' }}
+    if: ${{ (!cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false && needs.changes.outputs.code == 'true') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     needs:
       - changes
       - pr-test-policy
@@ -1226,7 +1222,7 @@ jobs:
     # It skips for (a) PRs labeled `hotfix` (entry policy in docs/ops/RELEASE_CHECKLIST.md:
     # production-broken only, full-suite evidence from the previous green run linked in the
     # PR) and (b) tests-only diffs outside tests/e2e/ (cannot change the served app).
-    if: ${{ needs.changes.outputs.testsOnly != 'true' && !contains(github.event.pull_request.labels.*.name, 'hotfix') }}
+    if: ${{ (needs.changes.outputs.testsOnly != 'true') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     strategy:
       fail-fast: false
       matrix:
@@ -1300,7 +1296,7 @@ jobs:
     timeout-minutes: 15
     # needs: changes (not build) — no artifact consumed; see test-unit note.
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false) }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' )) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     strategy:
       fail-fast: false
       matrix:
@@ -1331,7 +1327,7 @@ jobs:
     runs-on: ubuntu-latest
     # needs: changes (not build) — no artifact consumed; see test-unit note.
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false) }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' )) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     env:
       JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
       API_KEY_SECRET: ci-test-api-key-secret-long
@@ -1359,7 +1355,7 @@ jobs:
     timeout-minutes: 20
     # needs: changes (not build) — the runner boots its own dev server.
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false) }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' )) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     env:
       JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
       API_KEY_SECRET: ci-test-api-key-secret-long
@@ -1381,7 +1377,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false) }}
+    if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.code == 'true' )) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     # ADVISORY until #10049 is resolved. Restoring this suite immediately surfaced a
     # real discrepancy that had been invisible while it could not run: GET
     # /api/mcp/audit answers 403 over loopback where the suite expects 200|401. That
@@ -1408,7 +1404,7 @@ jobs:
   ci-summary:
     name: CI Dashboard
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() }}
+    if: ${{ (!cancelled()) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     needs:
       - changes
       - lint

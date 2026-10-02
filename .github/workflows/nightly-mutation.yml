@@ -4,11 +4,14 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
 permissions:
   contents: read
 
 jobs:
   stryker:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release')) }}
     name: Stryker mutation (batch ${{ matrix.batch.name }} — advisory)
     runs-on: ubuntu-latest
     # Mutation testing is expensive. History of the budget:
@@ -144,7 +147,7 @@ jobs:
   mutation-ratchet:
     name: Mutation score ratchet (blocking)
     needs: stryker
-    if: always()
+    if: ${{ (always()) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'release'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
