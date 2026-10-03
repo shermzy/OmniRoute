@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import { randomBytes, randomUUID } from "crypto";
 import { setUserAgentHeader } from "../executors/base.ts";
 import { generateSessionId } from "../services/sessionManager.ts";
 
@@ -27,6 +27,64 @@ const AGENT_METADATA_HEADER_KEYS = ["x-session-id", "x-title"] as const;
  */
 function findHeader(headers: Record<string, string>, name: string): string | undefined {
   return Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
+}
+
+const OPENCODE_ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const OPENCODE_ID_RE = /^(ses|msg)_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const OPENCODE_FREE_CLI_USER_AGENT = "opencode/1.18.31";
+let opencodeIdTimestamp = 0;
+let opencodeIdCounter = 0;
+
+function createOpenCodeId(prefix: "ses" | "msg", descending: boolean): string {
+  const timestamp = Date.now();
+  if (timestamp !== opencodeIdTimestamp) {
+    opencodeIdTimestamp = timestamp;
+    opencodeIdCounter = 0;
+  }
+  opencodeIdCounter++;
+
+  let value = BigInt(timestamp) * 0x1000n + BigInt(opencodeIdCounter);
+  if (descending) value = ~value;
+
+  let time = "";
+  for (let i = 0; i < 6; i++) {
+    const shift = BigInt(40 - 8 * i);
+    time += Number((value >> shift) & 0xffn).toString(16).padStart(2, "0");
+  }
+  const bytes = randomBytes(14);
+  let suffix = "";
+  for (const byte of bytes) suffix += OPENCODE_ID_CHARS[byte % OPENCODE_ID_CHARS.length];
+  return `${prefix}_${time}${suffix}`;
+}
+
+/**
+ * Match the anonymous OpenCode CLI wire identity used by the current free tier.
+ *
+ * The free Zen gateway validates more than ordinary OpenAI compatibility. A
+ * generic UUID/session identity can be rejected with
+ * "OpenCode's free tier can only be used from within OpenCode" even from an
+ * egress where the official CLI succeeds. Keep this helper scoped to anonymous
+ * free-tier requests; keyed and opencode-go traffic must use the normal path.
+ */
+export function applyAnonymousFreeOpencodeHeaders(
+  headers: Record<string, string>,
+  clientHeaders: Record<string, string> = {}
+): void {
+  setUserAgentHeader(headers, OPENCODE_FREE_CLI_USER_AGENT);
+  headers["x-opencode-client"] = "cli";
+  headers["x-opencode-project"] = findHeader(clientHeaders, "x-opencode-project") || "global";
+
+  const clientSession = findHeader(clientHeaders, "x-opencode-session");
+  headers["x-opencode-session"] =
+    clientSession && OPENCODE_ID_RE.test(clientSession)
+      ? clientSession
+      : createOpenCodeId("ses", true);
+
+  const clientRequest = findHeader(clientHeaders, "x-opencode-request");
+  headers["x-opencode-request"] =
+    clientRequest && OPENCODE_ID_RE.test(clientRequest)
+      ? clientRequest
+      : createOpenCodeId("msg", false);
 }
 
 /**

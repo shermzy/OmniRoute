@@ -245,13 +245,17 @@ describe("OpencodeExecutor", () => {
       assert.deepEqual(fetchCalls[0].options.headers, result.headers);
     });
 
-    it("omits authorization when credentials are missing", async () => {
+    it("uses the anonymous OpenCode CLI contract when free-tier credentials are missing", async () => {
       const result = await zenExecutor.execute(createInput("minimax-m2.5-free", true, null));
 
-      assert.deepEqual(result.headers, {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-      });
+      assert.equal(result.headers.Authorization, "Bearer public");
+      assert.equal(result.headers["Content-Type"], "application/json");
+      assert.equal(result.headers.Accept, "text/event-stream");
+      assert.equal(result.headers["User-Agent"], "opencode/1.18.31");
+      assert.equal(result.headers["x-opencode-client"], "cli");
+      assert.equal(result.headers["x-opencode-project"], "global");
+      assert.match(result.headers["x-opencode-session"] ?? "", /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+      assert.match(result.headers["x-opencode-request"] ?? "", /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
       assert.deepEqual(fetchCalls[0].options.headers, result.headers);
     });
 
