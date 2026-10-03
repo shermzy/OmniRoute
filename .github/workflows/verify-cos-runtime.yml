@@ -1,0 +1,100 @@
+name: Verify Chat On Steroids runtime patch
+
+on:
+  push:
+    branches:
+      - feat/chat-on-steroids-runtime
+    paths:
+      - 'docs/integrations/chat-on-steroids-runtime.md'
+      - 'scripts/chat-on-steroids/**'
+      - 'patches/chat-on-steroids-2.1.11/**'
+      - '.github/workflows/verify-cos-runtime.yml'
+  pull_request:
+    paths:
+      - 'docs/integrations/chat-on-steroids-runtime.md'
+      - 'scripts/chat-on-steroids/**'
+      - 'patches/chat-on-steroids-2.1.11/**'
+      - '.github/workflows/verify-cos-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout OmniRoute branch
+        uses: actions/checkout@v4
+        with:
+          path: omniroute
+
+      - name: Checkout pinned Chat On Steroids 2.1.11 source
+        uses: actions/checkout@v4
+        with:
+          repository: totec448-spec/chat-on-steroids
+          ref: f51acbccdd734f524799ea92bb747be765fba1e4
+          path: cos
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: cos/package-lock.json
+
+      - name: Install test runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
+
+      - name: Install CoS dependencies
+        working-directory: cos
+        run: npm ci
+
+      - name: Confirm pinned CoS search-test baseline
+        working-directory: cos
+        shell: bash
+        run: |
+          set +e
+          NO_COLOR=1 npm test -- test/search.test.ts > /tmp/cos-search-baseline.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/cos-search-baseline.log
+          if [ "$status" -eq 0 ]; then
+            echo "Pinned CoS search baseline is green; remove the temporary exclusion from this workflow."
+            exit 1
+          fi
+          grep -F "counts files it searched, not files that matched" /tmp/cos-search-baseline.log
+          grep -F "expected 1 to be 3" /tmp/cos-search-baseline.log
+          echo "Confirmed pinned upstream 2.1.11 baseline: search.test.ts fails filesScanned 1 vs 3 before the runtime patch is applied."
+
+      - name: Apply staged runtime source
+        env:
+          COS_SOURCE_DIR: ${{ github.workspace }}/cos
+        run: node omniroute/scripts/chat-on-steroids/install-cos-source.mjs
+
+      - name: Assert patch scope
+        working-directory: cos
+        shell: bash
+        run: |
+          status="$(git status --porcelain=v1 --untracked-files=all | LC_ALL=C sort)"
+          expected="$(printf '%s\n' ' M src/main/index.ts' '?? src/main/runtime-server.ts' | LC_ALL=C sort)"
+          printf '%s\n' "$status"
+          if [ "$status" != "$expected" ]; then
+            echo "Unexpected files changed by the CoS installer."
+            exit 1
+          fi
+
+      - name: Typecheck CoS with runtime ingress
+        working-directory: cos
+        run: npm run typecheck
+
+      - name: Run CoS suite except proven upstream baseline assertion
+        working-directory: cos
+        shell: bash
+        run: |
+          npm test -- --testNamePattern="^(?!.*counts files it searched, not files that matched).*$"
